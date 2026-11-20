@@ -1,0 +1,86 @@
+<#
+.SYNOPSIS
+    Shared launcher logic for Run-DevApp-Inventory.ps1 and Run-NonProd-Inventory.ps1.
+    Do not run directly - run one of the environment launchers.
+
+.DESCRIPTION
+    - Refuses to run while any <FILL-ME> placeholder is left in the launcher's settings.
+    - Checks that every subscription ID is a GUID and that the signed-in account can see it.
+    - Warns loudly if a subscription name looks like PRODUCTION.
+    - Shows exactly what will be scanned and asks you to type the environment name to confirm
+      (skipped with -ListOnly; can be skipped with -Force for unattended runs).
+    - Calls Invoke-JavaInventory.ps1 with -EnvironmentLabel so each environment gets its own
+      report folder:  .\JavaInventory_<Label>_<timestamp>\
+#>
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory)][ValidatePattern('^[A-Za-z0-9_-]+$')][string]$EnvironmentLabel,
+    [Parameter(Mandatory)][string[]]$SubscriptionId,
+    [string[]]$ResourceGroupName,
+    [string[]]$VMName,
+    [int]$ThrottleLimit = 10,
+    [int]$ScanTimeoutMinutes = 45,
+    [switch]$SkipJarScan,
+    [switch]$ListOnly,
+    [switch]$Force,
+    [switch]$CleanupOnly,
+    [string]$StateFile,
+    [string]$OutputFolder
+)
+$ErrorActionPreference = 'Stop'
+
+# 1. Placeholders / format
+$check = @($SubscriptionId) + @($ResourceGroupName) + @($VMName) | Where-Object { $_ }
+$unfilled = @($check | Where-Object { $_ -match '<FILL' })
+if ($unfilled.Count) {
+    throw "[$EnvironmentLabel] Settings still contain <FILL-ME> placeholders. Edit the 'SETTINGS' block at the top of the launcher first."
+}
+foreach ($s in $SubscriptionId) {
+    if ($s -notmatch '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') { throw "[$EnvironmentLabel] '$s' is not a valid subscription ID (GUID)." }
+}
+
+# 2. Azure sign-in and subscription visibility
+Import-Module Az.Accounts -ErrorAction Stop | Out-Null
+if (-not (Get-AzContext)) { throw 'Not signed in to Azure. Run Connect-AzAccount first.' }
+
+$subInfo = foreach ($s in $SubscriptionId) {
+    try { Get-AzSubscription -SubscriptionId $s -WarningAction SilentlyContinue -ErrorAction Stop }
+    catch { throw "[$EnvironmentLabel] Subscription $s is not visible to $((Get-AzContext).Account.Id). Check the ID and your access." }
+}
+
+# 3. Production guard
+$looksProd = @($subInfo | Where-Object { $_.Name -match '(?i)prod' -and $_.Name -notmatch '(?i)non[\s_-]?prod|pre[\s_-]?prod|dev|test|uat|qa|sandbox|staging' })
+
+Write-Host ''
+Write-Host "==================== Java inventory: $EnvironmentLabel ====================" -ForegroundColor Cyan
+foreach ($si in $subInfo) { Write-Host ("  Subscription : {0}  ({1})  state: {2}" -f $si.Name, $si.Id, $si.State) }
+if ($ResourceGroupName) { Write-Host ("  Resource groups : {0}" -f ($ResourceGroupName -join ', ')) } else { Write-Host '  Resource groups : ALL in the subscription(s)' }
+if ($VMName) { Write-Host ("  VM filter    : {0}" -f ($VMName -join ', ')) } else { Write-Host '  VM filter    : ALL running Windows VMs' }
+Write-Host ("  Signed in as : {0}" -f (Get-AzContext).Account.Id)
+Write-Host '=======================================================================' -ForegroundColor Cyan
+if ($looksProd.Count) {
+    Write-Host ("WARNING: subscription name(s) look like PRODUCTION: {0}" -f ($looksProd.Name -join ', ')) -ForegroundColor Red
+    Write-Host "         This launcher is for '$EnvironmentLabel'. Check the subscription ID before continuing." -ForegroundColor Red
+}
+
+# 4. Confirmation (not needed for a dry run)
+if (-not $ListOnly -and (-not $Force -or $looksProd.Count)) {
+    $answer = Read-Host "Type '$EnvironmentLabel' to start the scan (anything else cancels)"
+    if ($answer -cne $EnvironmentLabel) { Write-Host 'Cancelled. Nothing was run.' -ForegroundColor Yellow; return }
+}
+
+# 5. Run the engine
+$engine = Join-Path $PSScriptRoot 'Invoke-JavaInventory.ps1'
+$p = @{
+    SubscriptionId     = $SubscriptionId
+    EnvironmentLabel   = $EnvironmentLabel
+    ThrottleLimit      = $ThrottleLimit
+    ScanTimeoutMinutes = $ScanTimeoutMinutes
+}
+if ($ResourceGroupName) { $p.ResourceGroupName = $ResourceGroupName }
+if ($VMName)            { $p.VMName = $VMName }
+if ($SkipJarScan)       { $p.SkipJarScan = $true }
+if ($ListOnly)          { $p.ListOnly = $true }
+if ($CleanupOnly)       { $p.CleanupOnly = $true; $p.StateFile = $StateFile }
+if ($OutputFolder)      { $p.OutputFolder = $OutputFolder }
+& $engine @p

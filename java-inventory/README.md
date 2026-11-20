@@ -6,7 +6,10 @@ The scan works through **Azure Run Command**, so you don't need WinRM, RDP or op
 
 | File | Runs where | Purpose |
 |---|---|---|
-| `Invoke-JavaInventory.ps1` | Your workstation or Cloud Shell | Finds the VMs, runs the scan in parallel, collects results, cleans up and builds the reports |
+| `Run-DevApp-Inventory.ps1` | Your workstation or Cloud Shell | **Launcher for DevApp.** Holds only the DevApp subscription settings |
+| `Run-NonProd-Inventory.ps1` | Your workstation or Cloud Shell | **Launcher for Non-Prod.** Holds only the Non-Prod subscription settings |
+| `Start-EnvironmentInventory.ps1` | Called by both launchers | Checks the settings, warns if a subscription looks like production, shows what will be scanned and asks you to confirm |
+| `Invoke-JavaInventory.ps1` | Called by the launchers | The shared engine: finds the VMs, runs the scan in parallel, collects results, cleans up and builds the reports |
 | `Get-JavaInventory.ps1` | On each VM, as SYSTEM, via Run Command | Read-only collector, also used for the fetch and cleanup steps |
 
 ---
@@ -76,6 +79,51 @@ These are audit records, and deleting them would be a security problem.
 
 ## 5. How to run it (start with a pilot)
 
+### 5a. Per environment, the normal way
+
+DevApp and Non-Prod are in **separate subscriptions** and are run **separately**. Each launcher scans only its own subscription and writes its own report folder: `JavaInventory_DevApp_<timestamp>\` or `JavaInventory_NonProd_<timestamp>\`. Both launchers use the same engine, so the two reports are always comparable.
+
+**One-time setup:** open each launcher and replace the `<FILL-ME>` value in its `SETTINGS` block with that environment's subscription ID. The launchers won't run while a placeholder is left. **Don't commit real subscription IDs** to a shared repo unless your team is fine with that.
+
+```powershell
+Connect-AzAccount
+```
+
+DevApp:
+
+```powershell
+.\Run-DevApp-Inventory.ps1 -ListOnly
+```
+
+```powershell
+.\Run-DevApp-Inventory.ps1 -VMName <one-devapp-vm>
+```
+
+```powershell
+.\Run-DevApp-Inventory.ps1
+```
+
+Non-Prod:
+
+```powershell
+.\Run-NonProd-Inventory.ps1 -ListOnly
+```
+
+```powershell
+.\Run-NonProd-Inventory.ps1 -VMName <one-nonprod-vm>
+```
+
+```powershell
+.\Run-NonProd-Inventory.ps1
+```
+
+**What each launcher checks before it runs anything:**
+- The subscription ID is a valid GUID and your account can see it.
+- The subscription name doesn't look like **production**. If it does, you see a red warning and the confirmation prompt can't be skipped.
+- You see the subscription, resource groups, VM filter and signed-in account, then type `DevApp` or `NonProd` to confirm. `-ListOnly` needs no confirmation because it runs nothing. Use `-Force` for unattended runs.
+
+### 5b. Using the engine directly
+
 ```powershell
 # 0. Sign in
 Connect-AzAccount
@@ -107,7 +155,8 @@ Useful switches:
 |---|---|
 | `-VMName 'devapp*'` | Filter by VM name; wildcards are allowed |
 | `-ResourceGroupName` | Limit the scan to specific resource groups |
-| `-EnvironmentTagName` | The tag used for the Environment column. Default: `Environment` |
+| `-EnvironmentLabel` | Fixed label for the Environment column, report title and folder name. The launchers set it to `DevApp` or `NonProd` |
+| `-EnvironmentTagName` | The tag used for the Environment column when no `-EnvironmentLabel` is given. Default: `Environment` |
 | `-ScanTimeoutMinutes` | Time limit for the disk scan. Default 45, hard maximum 80 (Run Command stops at 90 minutes) |
 | `-SkipJarScan` | Skip the JAR scan. It is a little faster but won't show software bundled with JARs |
 | `-KeepRunCommandExtension` | Don't remove the extension even if this run installed it |

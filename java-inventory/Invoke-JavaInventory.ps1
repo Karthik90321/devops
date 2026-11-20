@@ -52,6 +52,7 @@ param(
     [string[]]$TagValue,
     [string[]]$VMName,                         # wildcards allowed, e.g. 'devapp*'
     [string]$EnvironmentTagName = 'Environment',
+    [ValidatePattern('^[A-Za-z0-9_-]*$')][string]$EnvironmentLabel,   # e.g. DevApp / NonProd - overrides the tag for the Environment column, report title and folder name
     [ValidateRange(1, 50)][int]$ThrottleLimit = 10,
     [ValidateRange(5, 80)][int]$ScanTimeoutMinutes = 45,
     [switch]$SkipJarScan,
@@ -68,7 +69,11 @@ $JobWatchdogMin = 100                       # Run Command itself times out at 90
 $CollectorPath  = Join-Path $PSScriptRoot 'Get-JavaInventory.ps1'
 $RunId          = [guid]::NewGuid().ToString()
 $stamp          = Get-Date -Format 'yyyyMMdd_HHmmss'
-if (-not $OutputFolder) { $OutputFolder = Join-Path (Get-Location) ("JavaInventory_" + $stamp) }
+if (-not $OutputFolder) {
+    $prefix = 'JavaInventory_'
+    if ($EnvironmentLabel) { $prefix += $EnvironmentLabel + '_' }
+    $OutputFolder = Join-Path (Get-Location) ($prefix + $stamp)
+}
 
 function Write-Log { param([string]$Msg, [string]$Level = 'INFO')
     $c = switch ($Level) { 'WARN' { 'Yellow' } 'ERROR' { 'Red' } 'OK' { 'Green' } default { 'Gray' } }
@@ -127,8 +132,11 @@ if ($CleanupOnly) {
                 if ($TagValue -and -not ($TagValue | Where-Object { $tv -ieq $_ })) { continue }
             }
             $key = "$sub/$($vm.ResourceGroupName)/$($vm.Name)".ToLowerInvariant()
-            $envName = Get-TagValueCI $vm.Tags $EnvironmentTagName
-            if (-not $envName) { $envName = 'Unknown' }
+            if ($EnvironmentLabel) { $envName = $EnvironmentLabel }
+            else {
+                $envName = Get-TagValueCI $vm.Tags $EnvironmentTagName
+                if (-not $envName) { $envName = 'Unknown' }
+            }
             $st = [pscustomobject][ordered]@{
                 VMName = $vm.Name; ResourceGroup = $vm.ResourceGroupName; Subscription = $ctx.Subscription.Name; Environment = $envName
                 OsType = [string]$vm.StorageProfile.OsDisk.OsType; PowerState = [string]$vm.PowerState
@@ -424,10 +432,12 @@ if ($ResourceGroupName) { $scopeText += " | Resource groups: $($ResourceGroupNam
 if ($TagName) { $scopeText += " | Tag: $TagName = $(if ($TagValue) { $TagValue -join ', ' } else { '(any)' })" }
 if ($VMName) { $scopeText += " | VM filter: $($VMName -join ', ')" }
 
+$reportTitle = 'Java Inventory Summary'
+if ($EnvironmentLabel) { $reportTitle += ' - ' + $EnvironmentLabel }
 $card = { param($label, $value, $cls) "<div class='card $cls'><div class='v'>$(E $value)</div><div class='l'>$(E $label)</div></div>" }
 $html = @"
 <!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Java Inventory Summary</title>
+<title>$(E $reportTitle)</title>
 <style>
 :root{--bg:#f6f7f9;--fg:#1d2330;--muted:#5d6675;--card:#fff;--line:#dde1e7;--hi:#b42318;--hibg:#fde8e7;--rv:#9a6700;--rvbg:#fff4d6;--lo:#1a7f37;--lobg:#e6f4ea;--acc:#2457c5}
 @media (prefers-color-scheme:dark){:root{--bg:#14171c;--fg:#e6e9ee;--muted:#9aa3b2;--card:#1d2128;--line:#313742;--hi:#ff8a80;--hibg:#3a1d1c;--rv:#f2c14e;--rvbg:#3a3019;--lo:#6fd08c;--lobg:#1b3324;--acc:#7aa2ff}}
@@ -444,7 +454,7 @@ th{position:sticky;top:0;background:var(--card);font-weight:600} td{word-break:b
 .b-Failed{color:var(--hi);font-weight:600}.b-Skipped{color:var(--rv)}
 .note{background:var(--card);border-left:4px solid var(--rv);padding:10px 12px;border-radius:4px;margin-top:16px}
 </style></head><body><main>
-<h1>Java Inventory Summary</h1>
+<h1>$(E $reportTitle)</h1>
 <div class="muted">Generated $(E (Get-Date -Format 'yyyy-MM-dd HH:mm')) | Run ID $(E $RunId)<br>$(E $scopeText)</div>
 <div class="cards">
 $(& $card 'VMs in scope' $statusRows.Count '')
