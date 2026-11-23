@@ -82,6 +82,20 @@ The rules live in `Get-OracleLicenseRisk` in `Get-JavaInventory.ps1`. **Have you
 
 These are audit records, and deleting them would be a security problem.
 
+## 3a. Security review: how Defender or EDR may see this tool
+
+| Behaviour | How the tool limits it | What your SOC may see |
+|---|---|---|
+| Azure Run Command runs PowerShell as SYSTEM on many VMs | Required by the design. It is a documented Azure feature | Defender for Cloud / Defender for Servers can raise **Run Command usage** alerts. **Tell the SOC the run window in advance** |
+| Reading the modules (DLLs) of running processes | **Allow-list only:** only processes running from the same application folder as a Java runtime already found on disk, or Procrun/Tomcat wrappers. **Never** anything under `%SystemRoot%`, so credential-store, system and security processes are not opened | Nothing unusual |
+| Recursive scan of every fixed drive and user profile | Read-only metadata (names and file version info). File contents are never opened, except Java's small `release` text file | Possibly a "file and directory discovery" signal in advanced hunting. Low severity |
+| Results gzip-compressed and base64-encoded in the output | Encode only. The script never decodes data and runs it (no `Invoke-Expression`, no downloads, no `Add-Type`) | Unlikely to alert. Mention it to the SOC so it isn't mistaken for data exfiltration |
+| Deleting its own temp file and script copies after the run | Deletes only files carrying the tool's marker, or its own temp folder. Logs are never touched | File deletion events. Covered by telling the SOC in advance |
+| Process command lines collected | Secret-looking values are masked (`password=*****`) | None |
+| Unsigned scripts | Run Command runs them with its own execution policy | If **WDAC or AppLocker** is enforced, PowerShell drops to Constrained Language Mode and the collector **fails** (it uses .NET file APIs). Fix: sign the scripts with your organisation's code-signing certificate |
+
+**The report is internal-confidential.** It contains server names, user profile names (taken from paths) and masked command lines. Share it only with the people who need it.
+
 ## 4. Prerequisites
 
 - PowerShell 5.1 or 7.x with the Az module: `Install-Module Az -Scope CurrentUser`

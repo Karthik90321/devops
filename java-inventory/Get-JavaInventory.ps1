@@ -484,8 +484,10 @@ foreach ($es in $envSources) {
 
 # 2d. Running processes
 $procFindings = New-Object System.Collections.Generic.List[object]
+$allProcs = @()
+try { $allProcs = @(Get-CimInstance Win32_Process -ErrorAction Stop) } catch { $warnings.Add('Process query failed: ' + $_.Exception.Message) }
 try {
-    Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { $_.Name -in 'java.exe', 'javaw.exe', 'javaws.exe' } | ForEach-Object {
+    $allProcs | Where-Object { $_.Name -in 'java.exe', 'javaw.exe', 'javaws.exe' } | ForEach-Object {
         $exe = $_.ExecutablePath
         if ($exe) {
             $r = Resolve-JavaHome $exe
@@ -495,10 +497,27 @@ try {
     }
 } catch { $warnings.Add('Process query failed: ' + $_.Exception.Message) }
 
-# Processes that host a JVM in-process (jvm.dll loaded) e.g. tomcat9.exe / prunsrv.exe / vendor launchers
-foreach ($proc in (Get-Process -ErrorAction SilentlyContinue)) {
-    if ($proc.Id -in 0, 4) { continue }
-    if ($proc.ProcessName -in 'java', 'javaw', 'javaws') { continue }
+# Processes that host a JVM in-process (jvm.dll loaded) e.g. tomcat9.exe / prunsrv.exe / vendor launchers.
+# SECURITY: listing a process's modules opens that process for memory read. Doing that to Windows system or
+# security processes looks like credential theft / security-tool tampering. So this is an ALLOW-list, not a scan of every process:
+# a process is inspected ONLY if its .exe lives in the same application folder as a Java runtime that the disk
+# scan already found (or it is a Procrun/Tomcat service wrapper), and never if it runs from %SystemRoot%.
+# Every embedded JVM loads jvm.dll from a folder the disk scan finds, so this adds "which app is using it"
+# without opening unrelated processes.
+$homeRoots = @{}
+foreach ($hv in $homes.Values) { $homeRoots[(Get-AppRoot $hv.Path).ToLowerInvariant()] = $true }
+$sysRootPrefix = $env:SystemRoot.TrimEnd('\').ToLowerInvariant() + '\'
+$jvmHostCandidates = @($allProcs | Where-Object {
+    $exeP = [string]$_.ExecutablePath
+    $exeP -and
+    -not $exeP.ToLowerInvariant().StartsWith($sysRootPrefix) -and
+    $_.Name -notin 'java.exe', 'javaw.exe', 'javaws.exe' -and
+    ( $homeRoots.ContainsKey((Get-AppRoot (Split-Path $exeP -Parent)).ToLowerInvariant()) -or
+      ($_.Name -match '(?i)^(prunsrv|tomcat\d*w?|procrun)\.exe$') )
+})
+foreach ($cand in $jvmHostCandidates) {
+    $proc = Get-Process -Id $cand.ProcessId -ErrorAction SilentlyContinue
+    if (-not $proc) { continue }
     try {
         $jvm = $proc.Modules | Where-Object { $_.ModuleName -ieq 'jvm.dll' } | Select-Object -First 1
         if ($jvm) {
