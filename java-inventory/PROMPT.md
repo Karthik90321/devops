@@ -33,6 +33,11 @@ It has two purposes:
     - never load unloaded user hives, never compile code (no `Add-Type`), never touch audit or event logs
   - **Mask secrets** (password, pwd, secret, token, key, credential values) in any captured command line.
   - If anything raises a security concern, **stop and tell me** before continuing.
+  - **Never open system, credential or security processes**, and never list every process. That means no reading of LSASS modules or memory, and not even indirectly through WMI `CommandLine` for all processes. An earlier version did this and caused an LSASS alert on a domain controller.
+  - **Never scan Tier 0 servers** (domain controllers, AD CS, AD FS, Entra Connect). Detect them on the server and exit. Also support excluding VMs by name, and warn about Tier 0-looking names in the dry run.
+  - **Touch only local drive paths.** Never touch UNC or device paths taken from user-writable settings (risk of NTLM coercion).
+  - Use **no wildcard or recursive deletes, and never follow links**, in user-writable folders such as `C:\Windows\Temp`. Create temp folders with SYSTEM- and Administrators-only permissions.
+  - Pin the collector to an approved **SHA-256 hash**, and protect the CSVs against formula injection.
 - **Scan depth:** a full scan: registry and a disk scan of every fixed drive, with a time budget so it finishes within the Run Command limit.
 
 ## ACTION

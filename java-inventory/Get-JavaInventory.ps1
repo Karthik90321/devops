@@ -47,7 +47,8 @@ param(
     [string]$MaxScanSeconds = '3000',
     [string]$ChunkSize      = '3000',
     [string]$ChunkIndex     = '0',
-    [string]$LocalCsvPath   = ''
+    [string]$LocalCsvPath   = '',
+    [string]$AllowTier0     = 'false'    # 'true' only on explicit decision: domain controllers, CA, AD FS, Entra Connect are skipped by default
 )
 
 $ErrorActionPreference = 'Continue'
@@ -61,10 +62,35 @@ if ($RunId -and ($RunId -notmatch '^[A-Za-z0-9-]{1,64}$')) {
     Write-Output 'JINV-ERROR|Invalid RunId'
     exit 1
 }
+# WDAC / AppLocker put PowerShell into Constrained Language Mode, where this script cannot work.
+# Stop cleanly instead of half-running.
+if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
+    Write-Output ('JINV-ERROR|PowerShell is in ' + $ExecutionContext.SessionState.LanguageMode + ' (WDAC/AppLocker policy). Nothing was scanned. The scripts must be signed/allowed by your security team.')
+    exit 1
+}
+
 $chunkSz  = [int]$ChunkSize
 $WorkRoot = Join-Path $env:SystemRoot 'Temp'
 $WorkDir  = if ($RunId) { Join-Path $WorkRoot ("JavaInventory_" + $RunId) } else { $null }
 $B64File  = if ($WorkDir) { Join-Path $WorkDir 'JavaInventory.b64' } else { $null }
+
+# SECURITY: only ever touch LOCAL drive paths. Paths that come from user-writable places (user
+# environment variables, per-user registry, process paths) could point to \\attacker\share; touching
+# such a path as SYSTEM would send the server's machine-account credentials to that host.
+function Test-LocalPath {
+    param([string]$P)
+    if (-not $P) { return $false }
+    return ($P -match '^[A-Za-z]:\\') -and ($P -notmatch '^\\\\') -and ($P -notmatch '[\x00-\x1f<>|"?*]')
+}
+function Test-SafePath {
+    param([string]$P)
+    if (-not (Test-LocalPath $P)) { return $false }
+    return Test-Path -LiteralPath $P
+}
+function Test-IsReparsePoint {
+    param([string]$P)
+    try { return (([System.IO.File]::GetAttributes($P) -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) } catch { return $false }
+}
 
 function Write-Chunk {
     param([string]$Data, [int]$Index, [int]$Size)
@@ -80,8 +106,8 @@ function Write-Chunk {
 # Mode: Fetch  (return chunk N of a previous scan)
 # ------------------------------------------------------------------------------------------------
 if ($Mode -eq 'Fetch') {
-    if (-not $B64File -or -not (Test-Path -LiteralPath $B64File)) {
-        Write-Output 'JINV-ERROR|Result file not found (already cleaned up or wrong RunId)'
+    if (-not $B64File -or -not (Test-Path -LiteralPath $B64File) -or (Test-IsReparsePoint $WorkDir) -or (Test-IsReparsePoint $B64File)) {
+        Write-Output 'JINV-ERROR|Result file not found or not trusted (already cleaned up, wrong RunId, or replaced by a link)'
         exit 1
     }
     $data = [System.IO.File]::ReadAllText($B64File)
@@ -94,26 +120,37 @@ if ($Mode -eq 'Fetch') {
 # ------------------------------------------------------------------------------------------------
 if ($Mode -eq 'Cleanup') {
     $removed = 0
-    # 1. Our work folder(s). Only folders that look like ours AND contain only our result file.
-    Get-ChildItem -LiteralPath $WorkRoot -Directory -Filter 'JavaInventory_*' -ErrorAction SilentlyContinue |
-        ForEach-Object {
-            $items = @(Get-ChildItem -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue)
-            $onlyOurs = ($items.Count -eq 0) -or (@($items | Where-Object { $_.Name -ne 'JavaInventory.b64' }).Count -eq 0)
-            if ($onlyOurs) {
-                Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
-                if (-not (Test-Path -LiteralPath $_.FullName)) { $removed++ }
+    # 1. ONLY this run's work folder (exact RunId). SECURITY: C:\Windows\Temp is writable by normal users,
+    #    so we never delete by wildcard, never follow links (junctions/symlinks), never delete recursively,
+    #    and delete only our own file name. A link planted by someone else is left alone and reported.
+    if ($WorkDir -and (Test-Path -LiteralPath $WorkDir)) {
+        if (Test-IsReparsePoint $WorkDir) {
+            Write-Output ("JINV-CLEANUP-WARN|Work folder is a link, not deleted: {0}" -f $WorkDir)
+        } else {
+            $items = @(Get-ChildItem -LiteralPath $WorkDir -Force -ErrorAction SilentlyContinue)
+            $foreign = @($items | Where-Object { $_.Name -ne 'JavaInventory.b64' -or $_.PSIsContainer -or (Test-IsReparsePoint $_.FullName) })
+            if ($foreign.Count) {
+                Write-Output ("JINV-CLEANUP-WARN|Unexpected items in work folder, not deleted: {0}" -f $WorkDir)
+            } else {
+                if (Test-Path -LiteralPath $B64File) { Remove-Item -LiteralPath $B64File -Force -ErrorAction SilentlyContinue }
+                Remove-Item -LiteralPath $WorkDir -Force -ErrorAction SilentlyContinue      # no -Recurse: fails safely if not empty
+                if (-not (Test-Path -LiteralPath $WorkDir)) { $removed++ }
             }
         }
+    }
     # 2. Copies of this tool's scripts that the Run Command extension downloaded (only files that
     #    carry our marker; the currently running copy cannot delete itself and is skipped).
     $pluginRoot = 'C:\Packages\Plugins\Microsoft.CPlat.Core.RunCommandWindows'
     $scriptsRemoved = 0
     if (Test-Path -LiteralPath $pluginRoot) {
         Get-ChildItem -LiteralPath $pluginRoot -Recurse -File -Include *.ps1 -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -ne $PSCommandPath } |
+            Where-Object { $_.FullName -ne $PSCommandPath -and -not (Test-IsReparsePoint $_.FullName) } |
             ForEach-Object {
                 try {
-                    $head = [System.IO.File]::ReadAllText($_.FullName)
+                    # Read only the first 4 KB (the marker is in the header) - other admins' scripts are not read in full
+                    $fs = [System.IO.File]::OpenRead($_.FullName)
+                    try { $buf = New-Object byte[] 4096; $n = $fs.Read($buf, 0, 4096) } finally { $fs.Dispose() }
+                    $head = [System.Text.Encoding]::UTF8.GetString($buf, 0, $n)
                     if ($head -match 'JINV-TOOL-MARKER') {
                         Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop
                         $scriptsRemoved++
@@ -168,12 +205,80 @@ function New-Finding {
     }
 }
 
+function Publish-Findings {
+    # Compress + base64 the findings and write chunk 0 to STDOUT. If more than one chunk is needed, the full
+    # payload is kept in a fresh work folder that only SYSTEM and Administrators can access.
+    param($List)
+    if ($LocalCsvPath) {
+        if (-not (Test-LocalPath $LocalCsvPath)) { Write-Output 'JINV-ERROR|LocalCsvPath must be a local path'; exit 1 }
+        $List | Export-Csv -LiteralPath $LocalCsvPath -NoTypeInformation -Encoding UTF8
+        Write-Output ("Wrote {0} findings to {1}" -f @($List).Count, $LocalCsvPath)
+        if (-not $RunId) { exit 0 }
+    }
+    $csvText = ($List | ConvertTo-Csv -NoTypeInformation) -join "`n"
+    $bytes   = [System.Text.Encoding]::UTF8.GetBytes($csvText)
+    $ms = New-Object System.IO.MemoryStream
+    $gz = New-Object System.IO.Compression.GZipStream($ms, [System.IO.Compression.CompressionMode]::Compress)
+    $gz.Write($bytes, 0, $bytes.Length); $gz.Close()
+    $b64 = [Convert]::ToBase64String($ms.ToArray())
+    $ms.Dispose()
+    if ($b64.Length -gt $chunkSz) {
+        if (-not $RunId) { Write-Output 'JINV-ERROR|Result exceeds one chunk and no RunId was given; use -LocalCsvPath for manual runs'; exit 1 }
+        # SECURITY: the folder must NOT already exist (someone could have planted it or a link), and is
+        # created with an explicit ACL: SYSTEM + Administrators only, no inheritance.
+        if (Test-SafePath $WorkDir) { Write-Output 'JINV-ERROR|Work folder already exists - refusing to use it'; exit 1 }
+        $acl = New-Object System.Security.AccessControl.DirectorySecurity
+        $acl.SetAccessRuleProtection($true, $false)
+        foreach ($sid in 'S-1-5-18', 'S-1-5-32-544') {
+            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                (New-Object System.Security.Principal.SecurityIdentifier $sid), 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+            $acl.AddAccessRule($rule)
+        }
+        $null = [System.IO.Directory]::CreateDirectory($WorkDir, $acl)
+        if (Test-IsReparsePoint $WorkDir) { Write-Output 'JINV-ERROR|Work folder is a link - refusing to use it'; exit 1 }
+        [System.IO.File]::WriteAllText($B64File, $b64)
+    }
+    Write-Chunk -Data $b64 -Index 0 -Size $chunkSz
+}
+
+# ------------------------------------------------------------------------------------------------
+# Tier 0 exclusion: domain controllers, certificate authorities, AD FS and Entra/Azure AD Connect are
+# never scanned unless explicitly allowed. Only the server's role and service names are checked here;
+# nothing else is read. The server is reported as EXCLUDED so the gap is visible in the report.
+# ------------------------------------------------------------------------------------------------
+$tier0Reasons = New-Object System.Collections.Generic.List[string]
+try {
+    $domainRole = (Get-CimInstance Win32_ComputerSystem -Property DomainRole -ErrorAction Stop).DomainRole
+    if ($domainRole -in 4, 5) { $tier0Reasons.Add('Domain Controller') }
+} catch { }
+$tier0Services = [ordered]@{ 'NTDS' = 'Domain Controller (NTDS)'; 'CertSvc' = 'Certificate Authority (AD CS)'; 'adfssrv' = 'AD FS'; 'ADSync' = 'Entra / Azure AD Connect' }
+foreach ($svcName in $tier0Services.Keys) {
+    if (Get-Service -Name $svcName -ErrorAction SilentlyContinue) {
+        if (-not $tier0Reasons.Contains($tier0Services[$svcName])) { $tier0Reasons.Add($tier0Services[$svcName]) }
+    }
+}
+if ($tier0Reasons.Count -and $AllowTier0 -notmatch '^(1|true|yes)$') {
+    $excl = New-Object System.Collections.Generic.List[object]
+    $excl.Add((New-Finding -FindingType 'ScanInfo' -Source 'Excluded' `
+        -Details ('EXCLUDED - Tier 0 server (' + ($tier0Reasons -join ', ') + '). Not scanned by design.')))
+    Publish-Findings $excl
+    exit 0
+}
+
 function Protect-CommandLine {
     param([string]$Text)
     if (-not $Text) { return '' }
-    # Mask values of anything that looks like a secret:  -Dfoo.password=abc  /  --token abc  /  pwd:abc
-    $t = [regex]::Replace($Text, '(?i)((?:pass(?:word|wd)?|pwd|secret|token|apikey|api[._-]?key|credential|keystorepass|truststorepass)[\w.\-]*\s*[=:]\s*)("[^"]*"|\S+)', '$1*****')
-    $t = [regex]::Replace($t, '(?i)(--?(?:pass(?:word)?|pwd|secret|token|key)\s+)("[^"]*"|\S+)', '$1*****')
+    # Mask values of anything that looks like a secret:
+    #   -Dfoo.password=abc  pwd:abc  AccountKey=...  SharedAccessKey=...  client_secret=...  sig=... (SAS)
+    $t = [regex]::Replace($Text, '(?i)((?:pass(?:word|wd|phrase)?|pwd|secret|token|apikey|api[._-]?key|accountkey|sharedaccesskey|access[._-]?key|private[._-]?key|client[._-]?secret|credential|keystorepass|truststorepass|\bsig)[\w.\-]*\s*[=:]\s*)("[^"]*"|''[^'']*''|[^\s;&"'']+)', '$1*****')
+    #   --password abc   -token abc
+    $t = [regex]::Replace($t, '(?i)(--?(?:pass(?:word)?|pwd|secret|token|key|apikey)\s+)("[^"]*"|\S+)', '$1*****')
+    #   scheme://user:pass@host
+    $t = [regex]::Replace($t, '(?i)([a-z][a-z0-9+.\-]*://[^/\s:@]+:)[^@\s/]+@', '$1*****@')
+    #   jdbc:oracle:thin:user/pass@host
+    $t = [regex]::Replace($t, '(?i)(jdbc:oracle:[a-z]+:[^/\s@]+/)[^@\s]+@', '$1*****@')
+    #   Authorization: Bearer xxx / Basic xxx
+    $t = [regex]::Replace($t, '(?i)\b((?:bearer|basic)\s+)[A-Za-z0-9._~+/=\-]{8,}', '$1*****')
     if ($t.Length -gt 400) { $t = $t.Substring(0, 400) + '...' }
     return $t
 }
@@ -350,6 +455,7 @@ function Add-HomeEvidence {
     if (-not $HomePath) { return }
     $hp = $HomePath.Trim().Trim('"').TrimEnd('\')
     if ($hp.Length -lt 3) { return }
+    if (-not (Test-LocalPath $hp)) { return }    # never network / device paths
     $k = $hp.ToLowerInvariant()
     if (-not $homes.ContainsKey($k)) {
         $homes[$k] = @{ Path = $hp; Sources = New-Object System.Collections.Generic.List[string]; Details = New-Object System.Collections.Generic.List[string] }
@@ -368,7 +474,7 @@ function Resolve-JavaHome {
     $h = Split-Path $dir -Parent
     if ((Split-Path $h -Leaf) -ieq 'jre') {                          # JDK 8 style jdk\jre -> fold into jdk
         $parent = Split-Path $h -Parent
-        if (Test-Path -LiteralPath (Join-Path $parent 'bin\javac.exe')) { $h = $parent }
+        if (Test-SafePath (Join-Path $parent 'bin\javac.exe')) { $h = $parent }
     }
     return @{ Home = $h; Layout = 'Standard' }
 }
@@ -440,7 +546,7 @@ foreach ($vr in $vendorRoots) {
             if ($vr -match 'Amazon' -and $k.Name -notmatch '(?i)corretto|jdk|java') { continue }
             if ($vr -match 'IBM' -and $k.Name -notmatch '(?i)java|jdk|jre|semeru') { continue }
             $keyShort = $k.Name -replace '^HKEY_LOCAL_MACHINE', 'HKLM'
-            if (Test-Path -LiteralPath (Join-Path $val 'bin\java.exe')) {
+            if (Test-SafePath (Join-Path $val 'bin\java.exe')) {
                 Add-HomeEvidence $val 'Registry' $keyShort
             } elseif ($valName -eq 'JavaHome') {
                 $registryTraces.Add(@{ Key = $keyShort; Value = $val })
@@ -463,7 +569,7 @@ foreach ($es in $envSources) {
         $val = $p.$vn
         if ($val) {
             $val = [Environment]::ExpandEnvironmentVariables([string]$val).Trim().Trim('"').TrimEnd('\')
-            $exists = Test-Path -LiteralPath (Join-Path $val 'bin\java.exe')
+            $exists = Test-SafePath (Join-Path $val 'bin\java.exe')
             if ($exists) { Add-HomeEvidence $val $vn $es.Scope }
             $envFindings.Add(@{ Name = $vn; Value = $val; Scope = $es.Scope; Exists = $exists })
         }
@@ -473,7 +579,7 @@ foreach ($es in $envSources) {
             if (-not $entry) { continue }
             $e = [Environment]::ExpandEnvironmentVariables($entry).Trim().Trim('"').TrimEnd('\')
             $isJavaish = $e -match '(?i)java|jdk|jre|corretto|zulu|temurin|adoptium|semeru|liberica'
-            $hasJava = Test-Path -LiteralPath (Join-Path $e 'java.exe')
+            $hasJava = Test-SafePath (Join-Path $e 'java.exe')
             if ($isJavaish -or $hasJava) {
                 if ($hasJava -and (Split-Path $e -Leaf) -ieq 'bin') { Add-HomeEvidence (Split-Path $e -Parent) 'PATH' $es.Scope }
                 $envFindings.Add(@{ Name = 'PATH entry'; Value = $e; Scope = $es.Scope; Exists = $hasJava })
@@ -484,37 +590,51 @@ foreach ($es in $envSources) {
 
 # 2d. Running processes
 $procFindings = New-Object System.Collections.Generic.List[object]
-$allProcs = @()
-try { $allProcs = @(Get-CimInstance Win32_Process -ErrorAction Stop) } catch { $warnings.Add('Process query failed: ' + $_.Exception.Message) }
-try {
-    $allProcs | Where-Object { $_.Name -in 'java.exe', 'javaw.exe', 'javaws.exe' } | ForEach-Object {
-        $exe = $_.ExecutablePath
-        if ($exe) {
-            $r = Resolve-JavaHome $exe
-            if ($r.Layout -eq 'Standard') { Add-HomeEvidence $r.Home 'RunningProcess' ("PID " + $_.ProcessId) }
-        }
-        $procFindings.Add(@{ Name = $_.Name; ProcId = $_.ProcessId; Exe = $exe; Cmd = (Protect-CommandLine $_.CommandLine); Via = 'java process' })
+# SECURITY: there is NO inspection of all processes. Get-Process -Name selects java.exe / javaw.exe / javaws.exe
+# from the system process list by NAME (no other process is opened); WMI is then asked only for those exact
+# process IDs. System, credential and security processes are never touched.
+foreach ($jproc in @(Get-Process -Name 'java', 'javaw', 'javaws' -ErrorAction SilentlyContinue)) {
+    $ci = $null
+    try { $ci = Get-CimInstance -ClassName Win32_Process -Filter ("ProcessId=" + [int]$jproc.Id) -Property ProcessId, ExecutablePath, CommandLine -ErrorAction Stop } catch { }
+    $exe = ''
+    if ($ci -and $ci.ExecutablePath) { $exe = [string]$ci.ExecutablePath } else { try { $exe = [string]$jproc.Path } catch { } }
+    if ($exe) {
+        $r = Resolve-JavaHome $exe
+        if ($r.Layout -eq 'Standard') { Add-HomeEvidence $r.Home 'RunningProcess' ("PID " + $jproc.Id) }
     }
-} catch { $warnings.Add('Process query failed: ' + $_.Exception.Message) }
+    $cmd = if ($ci) { Protect-CommandLine ([string]$ci.CommandLine) } else { '' }
+    $procFindings.Add(@{ Name = ($jproc.ProcessName + '.exe'); ProcId = $jproc.Id; Exe = $exe; Cmd = $cmd; Via = 'java process' })
+}
 
-# Processes that host a JVM in-process (jvm.dll loaded) e.g. tomcat9.exe / prunsrv.exe / vendor launchers.
-# SECURITY: listing a process's modules opens that process for memory read. Doing that to Windows system or
-# security processes looks like credential theft / security-tool tampering. So this is an ALLOW-list, not a scan of every process:
-# a process is inspected ONLY if its .exe lives in the same application folder as a Java runtime that the disk
-# scan already found (or it is a Procrun/Tomcat service wrapper), and never if it runs from %SystemRoot%.
-# Every embedded JVM loads jvm.dll from a folder the disk scan finds, so this adds "which app is using it"
-# without opening unrelated processes.
+# Services that host a JVM in-process (jvm.dll loaded), e.g. Tomcat (tomcat9.exe / prunsrv.exe) or vendor
+# service wrappers. SECURITY: candidates come from the SERVICE list (read from the registry - no process is
+# opened to build it). A service process is then opened to list its modules ONLY if its .exe lives in the same
+# application folder as a Java runtime the disk scan already found, or it is a Procrun/Tomcat wrapper, and
+# never if it runs from %SystemRoot%. System, credential and security processes are therefore never opened.
+# Every embedded JVM loads jvm.dll from a folder the disk scan finds, so this only adds "which app uses it".
 $homeRoots = @{}
 foreach ($hv in $homes.Values) { $homeRoots[(Get-AppRoot $hv.Path).ToLowerInvariant()] = $true }
 $sysRootPrefix = $env:SystemRoot.TrimEnd('\').ToLowerInvariant() + '\'
-$jvmHostCandidates = @($allProcs | Where-Object {
-    $exeP = [string]$_.ExecutablePath
-    $exeP -and
-    -not $exeP.ToLowerInvariant().StartsWith($sysRootPrefix) -and
-    $_.Name -notin 'java.exe', 'javaw.exe', 'javaws.exe' -and
-    ( $homeRoots.ContainsKey((Get-AppRoot (Split-Path $exeP -Parent)).ToLowerInvariant()) -or
-      ($_.Name -match '(?i)^(prunsrv|tomcat\d*w?|procrun)\.exe$') )
-})
+$runningServices = @()
+try { $runningServices = @(Get-CimInstance -ClassName Win32_Service -Filter "State='Running'" -Property Name, ProcessId, PathName -ErrorAction Stop) } catch { $warnings.Add('Service query failed: ' + $_.Exception.Message) }
+$jvmHostCandidates = New-Object System.Collections.Generic.List[object]
+$seenPids = @{}
+foreach ($svc in $runningServices) {
+    if (-not $svc.ProcessId -or $seenPids.ContainsKey([int]$svc.ProcessId)) { continue }
+    $pn = [string]$svc.PathName
+    $exeP = ''
+    if ($pn -match '^\s*"([^"]+)"') { $exeP = $matches[1] } elseif ($pn -match '^\s*(\S+?\.exe)\b') { $exeP = $matches[1] }
+    if (-not (Test-LocalPath $exeP)) { continue }
+    if ($exeP.ToLowerInvariant().StartsWith($sysRootPrefix)) { continue }
+    $exeName = [System.IO.Path]::GetFileName($exeP)
+    if ($exeName -in 'java.exe', 'javaw.exe', 'javaws.exe') { continue }     # already covered above
+    $isWrapper = $exeName -match '(?i)^(prunsrv|tomcat\d*w?|procrun)\.exe$'
+    $sameApp   = $homeRoots.ContainsKey((Get-AppRoot (Split-Path $exeP -Parent)).ToLowerInvariant())
+    if ($isWrapper -or $sameApp) {
+        $seenPids[[int]$svc.ProcessId] = $true
+        $jvmHostCandidates.Add([pscustomobject]@{ ProcessId = [int]$svc.ProcessId; Service = $svc.Name })
+    }
+}
 foreach ($cand in $jvmHostCandidates) {
     $proc = Get-Process -Id $cand.ProcessId -ErrorAction SilentlyContinue
     if (-not $proc) { continue }
@@ -545,7 +665,7 @@ foreach ($pr in 'HKLM:\SOFTWARE\Apache Software Foundation\Procrun 2.0', 'HKLM:\
     Get-ChildItem $pr -ErrorAction SilentlyContinue | ForEach-Object {
         $jk = Join-Path $_.PSPath 'Parameters\Java'
         $jp = Get-ItemProperty $jk -ErrorAction SilentlyContinue
-        if ($jp -and $jp.Jvm -and $jp.Jvm -ne 'auto' -and (Test-Path -LiteralPath $jp.Jvm)) {
+        if ($jp -and $jp.Jvm -and $jp.Jvm -ne 'auto' -and (Test-SafePath $jp.Jvm)) {
             $r = Resolve-JavaHome $jp.Jvm
             if ($r.Layout -eq 'Standard') { Add-HomeEvidence $r.Home 'ServiceConfig' ("Procrun service " + $_.PSChildName) }
         }
@@ -557,25 +677,25 @@ foreach ($pr in 'HKLM:\SOFTWARE\Apache Software Foundation\Procrun 2.0', 'HKLM:\
 # ------------------------------------------------------------------------------------------------
 $standardRx = '(?i)^[a-z]:\\program files( \(x86\))?\\(java|eclipse adoptium|eclipse foundation|adoptopenjdk|amazon corretto|zulu|azul systems|microsoft\\jdk|bellsoft|semeru|ibm\\java|sapmachine|openjdk|redhat|ojdkbuild|graalvm)\\'
 $oracleProductRx = '(?i)\\oracle\\middleware|weblogic|wlserver|\\oracle_common\\|\\oracle\\product\\|\\client_\d|dbhome|\\jdeveloper|oraclehome|\\oracle\\(ora|client|instantclient)|\\sqldeveloper\\|\\ords\\|\\odi\\|\\oem\\|agent13c|\\hyperion\\|\\epm|peoplesoft|\\jde\\'
-$homeList = @($homes.Values | Where-Object { Test-Path -LiteralPath $_.Path })
+$homeList = @($homes.Values | Where-Object { Test-SafePath $_.Path })
 
 foreach ($h in $homeList) {
     $hp = $h.Path
     $release = @{}
     $relFile = Join-Path $hp 'release'
-    if (Test-Path -LiteralPath $relFile) {
+    if (Test-SafePath $relFile) {
         Get-Content -LiteralPath $relFile -ErrorAction SilentlyContinue | ForEach-Object {
             if ($_ -match '^\s*([A-Z_]+)\s*=\s*"?(.*?)"?\s*$') { $release[$matches[1]] = $matches[2] }
         }
     }
     $bin = Join-Path $hp 'bin\java.exe'
-    if (-not (Test-Path -LiteralPath $bin)) { $bin = Join-Path $hp 'bin\javaw.exe' }
-    if (-not (Test-Path -LiteralPath $bin)) {
+    if (-not (Test-SafePath $bin)) { $bin = Join-Path $hp 'bin\javaw.exe' }
+    if (-not (Test-SafePath $bin)) {
         $jd = @(Get-ChildItem -LiteralPath (Join-Path $hp 'bin') -Filter jvm.dll -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1)
         if ($jd.Count) { $bin = $jd[0].FullName }
     }
     $fvi = $null
-    if (Test-Path -LiteralPath $bin) { try { $fvi = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($bin) } catch { } }
+    if (Test-SafePath $bin) { try { $fvi = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($bin) } catch { } }
 
     # Vendor
     $vendorRaw = ''
@@ -598,9 +718,9 @@ foreach ($h in $homeList) {
 
     # JDK / JRE
     $type = 'JRE'
-    if (Test-Path -LiteralPath (Join-Path $hp 'bin\javac.exe')) { $type = 'JDK' }
+    if (Test-SafePath (Join-Path $hp 'bin\javac.exe')) { $type = 'JDK' }
     elseif ($release['IMAGE_TYPE']) { $type = $release['IMAGE_TYPE'] }
-    elseif (-not (Test-Path -LiteralPath (Join-Path $hp 'lib\rt.jar')) -and (Test-Path -LiteralPath (Join-Path $hp 'lib\modules'))) { $type = 'JRE (custom runtime image)' }
+    elseif (-not (Test-SafePath (Join-Path $hp 'lib\rt.jar')) -and (Test-SafePath (Join-Path $hp 'lib\modules'))) { $type = 'JRE (custom runtime image)' }
 
     # Bundled vs standalone
     $registeredStandalone = $h.Sources.Contains('Registry')
@@ -662,7 +782,7 @@ foreach ($jp in $javaPrograms) {
     $isOracle = ($jp.Publisher -match '(?i)oracle|sun micro') -or ($jp.Name -match '(?i)^java(\(tm\))?\s*(se\s*)?(\d|development|runtime|auto updater|platform)')
     $isOracle = $isOracle -and ($jp.Name -notmatch '(?i)openjdk|corretto|zulu|temurin|adoptium|liberica|semeru|sapmachine|microsoft')
     $risk = if ($isOracle -and $jp.Name -notmatch '(?i)auto updater') { Get-OracleLicenseRisk -Major $ver.Major -Update $ver.Update -Flavor 'OracleJDK' -InOracleProduct $false } else { @($(if ($isOracle) { 'Review' } else { 'None' }), '') }
-    $exists = if ($jp.InstallLocation) { [string](Test-Path -LiteralPath $jp.InstallLocation) } else { 'Unknown' }
+    $exists = if ($jp.InstallLocation) { [string](Test-SafePath $jp.InstallLocation) } else { 'Unknown' }
     $findings.Add((New-Finding -FindingType 'InstalledProgram' -Path $jp.InstallLocation -Vendor $vendor -Version $jp.Version `
         -MajorVersion $ver.Major -UpdateVersion $ver.Update -IsOracle ([string]$isOracle) -OracleLicenseRisk $risk[0] -LicenseNote $risk[1] `
         -OwningApplication $jp.Name -Source 'Add/Remove Programs' `
@@ -731,28 +851,5 @@ Remove-PSDrive -Name JINVHKU -ErrorAction SilentlyContinue
 # ------------------------------------------------------------------------------------------------
 # 4. Output
 # ------------------------------------------------------------------------------------------------
-if ($LocalCsvPath) {
-    $findings | Export-Csv -LiteralPath $LocalCsvPath -NoTypeInformation -Encoding UTF8
-    Write-Output ("Wrote {0} findings to {1}" -f $findings.Count, $LocalCsvPath)
-    if (-not $RunId) { exit 0 }
-}
-
-$csvText = ($findings | ConvertTo-Csv -NoTypeInformation) -join "`n"
-$bytes   = [System.Text.Encoding]::UTF8.GetBytes($csvText)
-$ms = New-Object System.IO.MemoryStream
-$gz = New-Object System.IO.Compression.GZipStream($ms, [System.IO.Compression.CompressionMode]::Compress)
-$gz.Write($bytes, 0, $bytes.Length); $gz.Close()
-$b64 = [Convert]::ToBase64String($ms.ToArray())
-$ms.Dispose()
-
-if ($b64.Length -gt $chunkSz) {
-    if (-not $RunId) {
-        Write-Output 'JINV-ERROR|Result exceeds one chunk and no RunId was given; use -LocalCsvPath for manual runs'
-        exit 1
-    }
-    # Multi-chunk: persist once so the orchestrator can fetch the remaining parts, then it runs Cleanup.
-    $null = New-Item -ItemType Directory -Path $WorkDir -Force
-    [System.IO.File]::WriteAllText($B64File, $b64)
-}
-Write-Chunk -Data $b64 -Index 0 -Size $chunkSz
+Publish-Findings $findings
 exit 0

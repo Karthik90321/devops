@@ -51,6 +51,9 @@ param(
     [string]$TagName,
     [string[]]$TagValue,
     [string[]]$VMName,                         # wildcards allowed, e.g. 'devapp*'
+    [string[]]$ExcludeVMName,                  # wildcards allowed - never touched (e.g. domain controllers)
+    [string]$ExpectedCollectorSha256,          # if set, the run stops unless Get-JavaInventory.ps1 has exactly this hash
+    [switch]$IncludeTier0Servers,              # NOT recommended: lets the collector scan DCs / CA / AD FS / Entra Connect
     [string]$EnvironmentTagName = 'Environment',
     [ValidatePattern('^[A-Za-z0-9_-]*$')][string]$EnvironmentLabel,   # e.g. DevApp / NonProd - overrides the tag for the Environment column, report title and folder name
     [ValidateRange(1, 50)][int]$ThrottleLimit = 10,
@@ -66,6 +69,10 @@ param(
 $ErrorActionPreference = 'Stop'
 $ChunkSize      = 3000                      # base64 chars per chunk (stays well under the 4,096-byte limit)
 $JobWatchdogMin = 100                       # Run Command itself times out at 90 min
+$MaxChunks      = 400                       # ~1.2 MB compressed per VM; more than this is refused (use -SkipJarScan)
+$MaxPayloadMB   = 50                        # decompressed size limit per VM (protects this PC from a hostile VM)
+# Names that usually mean a Tier 0 server (domain controller, CA, AD FS, Entra Connect) - used only as a WARNING hint
+$Tier0NameRx    = '(?i)(^|[-_.])(dc|adds|addc|rodc|pdc|bdc|adfs|adcs|ca|pki|aadc|aadconnect|adsync|entraconnect)\d*($|[-_.])|domaincontroller'
 $CollectorPath  = Join-Path $PSScriptRoot 'Get-JavaInventory.ps1'
 $RunId          = [guid]::NewGuid().ToString()
 $stamp          = Get-Date -Format 'yyyyMMdd_HHmmss'
@@ -88,9 +95,14 @@ foreach ($m in 'Az.Accounts', 'Az.Compute') {
 }
 Import-Module Az.Accounts, Az.Compute -ErrorAction Stop | Out-Null
 if (-not (Test-Path -LiteralPath $CollectorPath)) { throw "Collector not found: $CollectorPath" }
+$CollectorHash = (Get-FileHash -LiteralPath $CollectorPath -Algorithm SHA256).Hash
+if ($ExpectedCollectorSha256 -and ($CollectorHash -ne $ExpectedCollectorSha256.Trim().ToUpperInvariant())) {
+    throw "Get-JavaInventory.ps1 hash mismatch. Expected $ExpectedCollectorSha256 but found $CollectorHash. The script was changed - do not run it until you know why."
+}
 if (-not (Get-AzContext)) { throw 'Not signed in to Azure. Run Connect-AzAccount first.' }
 $null = New-Item -ItemType Directory -Path $OutputFolder -Force
 Write-Log "Output folder: $OutputFolder"
+Write-Log "Collector SHA-256: $CollectorHash"
 
 # ------------------------------------------------------------------------------------------------
 # Discover target VMs (or load them from a state file)
@@ -141,8 +153,13 @@ if ($CleanupOnly) {
                 VMName = $vm.Name; ResourceGroup = $vm.ResourceGroupName; Subscription = $ctx.Subscription.Name; Environment = $envName
                 OsType = [string]$vm.StorageProfile.OsDisk.OsType; PowerState = [string]$vm.PowerState
                 Status = 'Pending'; Detail = ''; Chunks = 0; Findings = 0; ExtensionPreExisting = ''; TempFilesCleaned = ''; ExtensionRemoved = ''
+                Tier0Hint = $(if ($vm.Name -match $Tier0NameRx) { 'CHECK: name looks like a Tier 0 server (DC/CA/ADFS/Entra Connect) - add to ExcludeVMName' } else { '' })
             }
             $status[$key] = $st
+            if ($ExcludeVMName) {
+                $ex = $false; foreach ($p in $ExcludeVMName) { if ($vm.Name -like $p) { $ex = $true } }
+                if ($ex) { $st.Status = 'Excluded'; $st.Detail = 'Excluded by ExcludeVMName - nothing was run on this VM'; continue }
+            }
             if ($st.OsType -ne 'Windows') { $st.Status = 'Skipped'; $st.Detail = 'Not a Windows VM'; continue }
             if ($st.PowerState -notmatch 'running') { $st.Status = 'Skipped'; $st.Detail = "VM not running ($($st.PowerState)) - start it or scan later"; continue }
             $targets.Add([pscustomobject]@{ Key = $key; Subscription = $sub; ResourceGroup = $vm.ResourceGroupName; Name = $vm.Name
@@ -151,10 +168,13 @@ if ($CleanupOnly) {
     }
 }
 
-Write-Log ("Targets: {0} running Windows VM(s); skipped: {1}" -f $targets.Count, @($status.Values | Where-Object Status -eq 'Skipped').Count)
+Write-Log ("Targets: {0} running Windows VM(s); skipped: {1}; excluded: {2}" -f $targets.Count, @($status.Values | Where-Object Status -eq 'Skipped').Count, @($status.Values | Where-Object Status -eq 'Excluded').Count)
+$tier0Suspects = @($status.Values | Where-Object { $_.Tier0Hint -and $_.Status -ne 'Excluded' })
+foreach ($t0 in $tier0Suspects) { Write-Log ("{0}: {1}" -f $t0.VMName, $t0.Tier0Hint) 'WARN' }
 if ($ListOnly) {
-    $status.Values | Sort-Object Environment, VMName | Format-Table VMName, ResourceGroup, Environment, OsType, PowerState, Status, Detail -AutoSize
-    $status.Values | Export-Csv (Join-Path $OutputFolder 'JavaInventory_TargetList.csv') -NoTypeInformation -Encoding UTF8
+    $status.Values | Sort-Object Environment, VMName | Format-Table VMName, ResourceGroup, Environment, OsType, PowerState, Status, Tier0Hint, Detail -AutoSize
+    $status.Values | Sort-Object Environment, VMName | Select-Object VMName, ResourceGroup, Subscription, Environment, OsType, PowerState, Status, Tier0Hint, Detail |
+        Export-Csv (Join-Path $OutputFolder 'JavaInventory_TargetList.csv') -NoTypeInformation -Encoding UTF8
     Write-Log 'ListOnly: nothing was run on any VM.' 'OK'
     return
 }
@@ -211,7 +231,8 @@ function Start-VMTask { param($Task)
     switch ($Task.Kind) {
         'Scan'      { $p.CommandId = 'RunPowerShellScript'; $p.ScriptPath = $CollectorPath
                       $p.Parameter = @{ Mode = 'Scan'; RunId = $RunId; ScanJars = ([string](-not $SkipJarScan)).ToLower()
-                                        MaxScanSeconds = [string]($ScanTimeoutMinutes * 60); ChunkSize = [string]$ChunkSize } }
+                                        MaxScanSeconds = [string]($ScanTimeoutMinutes * 60); ChunkSize = [string]$ChunkSize
+                                        AllowTier0 = ([string][bool]$IncludeTier0Servers).ToLower() } }
         'Fetch'     { $p.CommandId = 'RunPowerShellScript'; $p.ScriptPath = $CollectorPath
                       $p.Parameter = @{ Mode = 'Fetch'; RunId = $RunId; ChunkIndex = [string]$Task.Chunk; ChunkSize = [string]$ChunkSize } }
         'Cleanup'   { $p.CommandId = 'RunPowerShellScript'; $p.ScriptPath = $CollectorPath
@@ -241,8 +262,16 @@ function ConvertFrom-Payload { param([string]$B64)
     $bytes = [Convert]::FromBase64String($B64)
     $in = New-Object System.IO.MemoryStream(, $bytes)
     $gz = New-Object System.IO.Compression.GZipStream($in, [System.IO.Compression.CompressionMode]::Decompress)
-    $sr = New-Object System.IO.StreamReader($gz, [System.Text.Encoding]::UTF8)
-    $text = $sr.ReadToEnd(); $sr.Close()
+    # Read with a hard size limit (a hostile/compromised VM could send a decompression bomb)
+    $out = New-Object System.IO.MemoryStream
+    $buf = New-Object byte[] 65536
+    $limit = $MaxPayloadMB * 1MB
+    while (($n = $gz.Read($buf, 0, $buf.Length)) -gt 0) {
+        $out.Write($buf, 0, $n)
+        if ($out.Length -gt $limit) { $gz.Close(); throw "Result larger than $MaxPayloadMB MB after decompression - refused" }
+    }
+    $gz.Close()
+    $text = [System.Text.Encoding]::UTF8.GetString($out.ToArray()); $out.Dispose()
     return @(($text -split "`n") | Where-Object { $_ } | ConvertFrom-Csv)
 }
 
@@ -298,6 +327,13 @@ while ($queue.Count -gt 0 -or $running.Count -gt 0) {
                     break
                 }
                 $total = [int]$mk.Groups[1].Value; $idx = [int]$mk.Groups[2].Value; $data = $mk.Groups[3].Value
+                if ($total -gt $MaxChunks -or $idx -ge $total) {
+                    $st.Status = 'Failed'; $st.Detail = "Result too large ($total chunks, limit $MaxChunks). Re-run this VM with -SkipJarScan."
+                    Write-Log "$($vm.Name): $($st.Detail)" 'ERROR'
+                    $chunks.Remove($vm.Key)
+                    $queue.Enqueue(@{ VM = $vm; Kind = 'Cleanup' })
+                    break
+                }
                 if (-not $chunks.ContainsKey($vm.Key)) { $chunks[$vm.Key] = New-Object string[] $total }
                 $chunks[$vm.Key][$idx] = $data
                 $st.Chunks = $total
@@ -318,6 +354,7 @@ while ($queue.Count -gt 0 -or $running.Count -gt 0) {
                         $st.Status = 'Completed'
                         $info = $rows | Where-Object FindingType -eq 'ScanInfo' | Select-Object -First 1
                         if ($info -and $info.Details -match 'TimedOut: True') { $st.Status = 'Completed (partial - time budget hit)' }
+                        if ($info -and $info.Source -eq 'Excluded') { $st.Status = 'Excluded'; $st.Findings = 0 }
                         $st.Detail = if ($info) { $info.Details } else { '' }
                         Write-Log ("{0}: scan complete - {1} Java-related finding(s)" -f $vm.Name, $javaRows.Count) 'OK'
                     } catch {
@@ -331,6 +368,11 @@ while ($queue.Count -gt 0 -or $running.Count -gt 0) {
             'Cleanup' {
                 if (-not $jobError -and $io.Out -match 'JINV-CLEANUP\|folders=(\d+)\|scripts=(\d+)') {
                     $st.TempFilesCleaned = "Yes (folders removed: $($matches[1]), script copies removed: $($matches[2]))"
+                    $cw = [regex]::Matches([string]$io.Out, 'JINV-CLEANUP-WARN\|([^\r\n]+)')
+                    if ($cw.Count) {
+                        $st.TempFilesCleaned = 'CHECK - ' + (@($cw | ForEach-Object { $_.Groups[1].Value }) -join '; ')
+                        Write-Log "$($vm.Name): cleanup left something for manual review - $($st.TempFilesCleaned)" 'WARN'
+                    }
                 } else {
                     $st.TempFilesCleaned = 'FAILED - ' + ($jobError + ' ' + $io.Err).Trim()
                     Write-Log "$($vm.Name): cleanup failed - re-run with -CleanupOnly" 'WARN'
@@ -365,8 +407,22 @@ foreach ($t in $targets) {
 $cols = 'Environment', 'VMName', 'ComputerName', 'FindingType', 'Vendor', 'Version', 'MajorVersion', 'UpdateVersion', 'JavaType',
         'Bundled', 'OwningApplication', 'Path', 'IsOracle', 'OracleLicenseRisk', 'LicenseNote', 'Source', 'Details',
         'ResourceGroup', 'Subscription', 'ScanTime'
+# SECURITY: values such as folder and program names come from the servers (partly user-controlled).
+# A cell starting with = + - @ (or tab/CR) is executed as a formula by Excel, so prefix it with a quote.
+function ConvertTo-SafeCsvRow { param([Parameter(ValueFromPipeline)]$Row, [string[]]$Columns)
+    process {
+        $o = [ordered]@{}
+        $names = if ($Columns) { $Columns } else { @($Row.PSObject.Properties | ForEach-Object { $_.Name }) }
+        foreach ($c in $names) {
+            $v = [string]$Row.$c
+            if ($v -match '^[=+\-@\t\r]') { $v = "'" + $v }
+            $o[$c] = $v
+        }
+        [pscustomobject]$o
+    }
+}
 $statusRows = @($status.Values | Sort-Object Environment, VMName)
-$statusRows | Export-Csv (Join-Path $OutputFolder 'JavaInventory_ServerStatus.csv') -NoTypeInformation -Encoding UTF8
+$statusRows | ConvertTo-SafeCsvRow | Export-Csv (Join-Path $OutputFolder 'JavaInventory_ServerStatus.csv') -NoTypeInformation -Encoding UTF8
 if ($CleanupOnly) {
     $statusRows | Format-Table VMName, TempFilesCleaned, ExtensionRemoved -AutoSize
     Write-Log 'Cleanup-only run finished.' 'OK'
@@ -374,9 +430,9 @@ if ($CleanupOnly) {
 }
 
 $sorted = @($allFindings | Sort-Object Environment, VMName, FindingType, Path)
-$sorted | Select-Object $cols | Export-Csv (Join-Path $OutputFolder 'JavaInventory_Findings.csv') -NoTypeInformation -Encoding UTF8
+$sorted | ConvertTo-SafeCsvRow -Columns $cols | Export-Csv (Join-Path $OutputFolder 'JavaInventory_Findings.csv') -NoTypeInformation -Encoding UTF8
 $oracle = @($sorted | Where-Object { $_.IsOracle -eq 'True' -or ($_.OracleLicenseRisk -and $_.OracleLicenseRisk -ne 'None') })
-$oracle | Select-Object $cols | Export-Csv (Join-Path $OutputFolder 'JavaInventory_Oracle.csv') -NoTypeInformation -Encoding UTF8
+$oracle | ConvertTo-SafeCsvRow -Columns $cols | Export-Csv (Join-Path $OutputFolder 'JavaInventory_Oracle.csv') -NoTypeInformation -Encoding UTF8
 
 # ---------------- HTML summary ----------------
 function E { param($s) [System.Net.WebUtility]::HtmlEncode([string]$s) }
@@ -408,6 +464,7 @@ $jarBundles = @($sorted | Where-Object FindingType -eq 'JarBundle')
 $scanned    = @($statusRows | Where-Object { $_.Status -like 'Completed*' })
 $failed     = @($statusRows | Where-Object Status -eq 'Failed')
 $skipped    = @($statusRows | Where-Object Status -eq 'Skipped')
+$excluded   = @($statusRows | Where-Object Status -eq 'Excluded')
 $withJava   = @($installs | Select-Object -ExpandProperty VMName -Unique)
 
 $byVendor = @($installs | Group-Object Vendor, MajorVersion | Sort-Object Count -Descending | ForEach-Object {
@@ -461,6 +518,7 @@ $(& $card 'VMs in scope' $statusRows.Count '')
 $(& $card 'Scanned' $scanned.Count '')
 $(& $card 'Failed' $failed.Count $(if ($failed.Count) { 'hi' } else { '' }))
 $(& $card 'Skipped (stopped / non-Windows)' $skipped.Count $(if ($skipped.Count) { 'rv' } else { '' }))
+$(& $card 'Excluded (Tier 0 / by name)' $excluded.Count '')
 $(& $card 'Servers with Java' $withJava.Count '')
 $(& $card 'Java installations' $installs.Count '')
 $(& $card 'Oracle installations' $oracleInst.Count $(if ($oracleInst.Count) { 'rv' } else { '' }))
@@ -470,7 +528,8 @@ $(& $card 'Apps bundling JARs' $jarBundles.Count '')
 </div>
 <div class="note"><b>Licensing caveat:</b> the risk ratings use Oracle licence rules as commonly published (BCL / OTN / NFTC by version).
 They are a triage aid, <b>not legal advice</b>. Have your licensing/SAM team confirm every <b>High</b> and <b>Review</b> item against your Oracle contracts.
-Skipped and failed servers are <b>not</b> covered, so the inventory is only complete when both counts are zero.</div>
+Skipped and failed servers are <b>not</b> covered, so the inventory is only complete when both counts are zero.
+Excluded servers (domain controllers and other Tier 0 servers, or servers excluded by name) are left out by design.</div>
 
 <h2>Oracle licensing findings</h2>
 $(New-Table $oracleSorted @('OracleLicenseRisk','Environment','VMName','FindingType','Vendor','Version','JavaType','Bundled','OwningApplication','Path','LicenseNote') 'No Oracle Java found')
@@ -493,8 +552,8 @@ $(New-Table @($sorted | Where-Object { $_.FindingType -in 'InstalledProgram','La
 <h2>Per-server status and cleanup</h2>
 $(New-Table $perServer @('Environment','VMName','Status','Installations','Oracle','HighRisk','Bundled','JarBundles','TempFilesCleaned','ExtensionRemoved'))
 
-<h2>Failed / skipped servers</h2>
-$(New-Table @($statusRows | Where-Object { $_.Status -in 'Failed','Skipped' }) @('Environment','VMName','ResourceGroup','Status','Detail') 'None - every server in scope was scanned')
+<h2>Failed / skipped / excluded servers</h2>
+$(New-Table @($statusRows | Where-Object { $_.Status -in 'Failed','Skipped','Excluded' }) @('Environment','VMName','ResourceGroup','Status','Detail') 'None - every server in scope was scanned')
 </main></body></html>
 "@
 $htmlPath = Join-Path $OutputFolder 'JavaInventory_Summary.html'

@@ -18,6 +18,8 @@ param(
     [Parameter(Mandatory)][string[]]$SubscriptionId,
     [string[]]$ResourceGroupName,
     [string[]]$VMName,
+    [string[]]$ExcludeVMName,
+    [string]$ExpectedCollectorSha256,
     [int]$ThrottleLimit = 10,
     [int]$ScanTimeoutMinutes = 45,
     [switch]$SkipJarScan,
@@ -30,13 +32,21 @@ param(
 $ErrorActionPreference = 'Stop'
 
 # 1. Placeholders / format
-$check = @($SubscriptionId) + @($ResourceGroupName) + @($VMName) | Where-Object { $_ }
+$check = @($SubscriptionId) + @($ResourceGroupName) + @($VMName) + @($ExcludeVMName) + @($ExpectedCollectorSha256) | Where-Object { $_ }
 $unfilled = @($check | Where-Object { $_ -match '<FILL' })
 if ($unfilled.Count) {
     throw "[$EnvironmentLabel] Settings still contain <FILL-ME> placeholders. Edit the 'SETTINGS' block at the top of the launcher first."
 }
 foreach ($s in $SubscriptionId) {
     if ($s -notmatch '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') { throw "[$EnvironmentLabel] '$s' is not a valid subscription ID (GUID)." }
+}
+
+# 1b. Collector integrity: show the hash; stop if it differs from the approved one
+$collector = Join-Path $PSScriptRoot 'Get-JavaInventory.ps1'
+if (-not (Test-Path -LiteralPath $collector)) { throw "Get-JavaInventory.ps1 not found next to the launcher." }
+$collectorHash = (Get-FileHash -LiteralPath $collector -Algorithm SHA256).Hash
+if ($ExpectedCollectorSha256 -and $collectorHash -ne $ExpectedCollectorSha256.Trim().ToUpperInvariant()) {
+    throw "[$EnvironmentLabel] Get-JavaInventory.ps1 has been CHANGED (hash $collectorHash, approved $ExpectedCollectorSha256). Do not run until you know why."
 }
 
 # 2. Azure sign-in and subscription visibility
@@ -56,6 +66,8 @@ Write-Host "==================== Java inventory: $EnvironmentLabel =============
 foreach ($si in $subInfo) { Write-Host ("  Subscription : {0}  ({1})  state: {2}" -f $si.Name, $si.Id, $si.State) }
 if ($ResourceGroupName) { Write-Host ("  Resource groups : {0}" -f ($ResourceGroupName -join ', ')) } else { Write-Host '  Resource groups : ALL in the subscription(s)' }
 if ($VMName) { Write-Host ("  VM filter    : {0}" -f ($VMName -join ', ')) } else { Write-Host '  VM filter    : ALL running Windows VMs' }
+if ($ExcludeVMName) { Write-Host ("  Excluded VMs : {0}" -f ($ExcludeVMName -join ', ')) } else { Write-Host '  Excluded VMs : none by name (Tier 0 servers are still refused by the collector itself)' }
+Write-Host ("  Collector    : SHA-256 {0} {1}" -f $collectorHash, $(if ($ExpectedCollectorSha256) { '(matches approved hash)' } else { '(no approved hash set - see SETTINGS)' }))
 Write-Host ("  Signed in as : {0}" -f (Get-AzContext).Account.Id)
 Write-Host '=======================================================================' -ForegroundColor Cyan
 if ($looksProd.Count) {
@@ -79,6 +91,8 @@ $p = @{
 }
 if ($ResourceGroupName) { $p.ResourceGroupName = $ResourceGroupName }
 if ($VMName)            { $p.VMName = $VMName }
+if ($ExcludeVMName)     { $p.ExcludeVMName = $ExcludeVMName }
+if ($ExpectedCollectorSha256) { $p.ExpectedCollectorSha256 = $ExpectedCollectorSha256 }
 if ($SkipJarScan)       { $p.SkipJarScan = $true }
 if ($ListOnly)          { $p.ListOnly = $true }
 if ($CleanupOnly)       { $p.CleanupOnly = $true; $p.StateFile = $StateFile }

@@ -69,7 +69,7 @@ The rules live in `Get-OracleLicenseRisk` in `Get-JavaInventory.ps1`. **Have you
 
 | Item | What happens |
 |---|---|
-| Temporary result file `%SystemRoot%\Temp\JavaInventory_<RunId>\JavaInventory.b64` | Written only when the result is bigger than about 3 KB (it is needed to get around the 4 KB Run Command output limit). **Deleted** by the cleanup step |
+| Temporary result file `%SystemRoot%\Temp\JavaInventory_<RunId>\JavaInventory.b64` | Written only when the result is bigger than about 3 KB (it is needed to get around the 4 KB Run Command output limit). The folder is SYSTEM/Administrators-only. **Deleted** by the cleanup step (exact folder only) |
 | Run Command extension `Microsoft.CPlat.Core.RunCommandWindows` | Azure installs it on first use. If it **was not** on the VM before, the script **removes** it at the end. If it **was** there before, it is left as it was |
 | Downloaded copies of the scripts in `C:\Packages\Plugins\Microsoft.CPlat.Core.RunCommandWindows\...` | Deleted by the cleanup step, or removed together with the extension |
 | Anything else | Nothing is installed, changed or deleted. No user hives are loaded and no code is compiled |
@@ -87,11 +87,17 @@ These are audit records, and deleting them would be a security problem.
 | Behaviour | How the tool limits it | What your SOC may see |
 |---|---|---|
 | Azure Run Command runs PowerShell as SYSTEM on many VMs | Required by the design. It is a documented Azure feature | Defender for Cloud / Defender for Servers can raise **Run Command usage** alerts. **Tell the SOC the run window in advance** |
-| Reading the modules (DLLs) of running processes | **Allow-list only:** only processes running from the same application folder as a Java runtime already found on disk, or Procrun/Tomcat wrappers. **Never** anything under `%SystemRoot%`, so credential-store, system and security processes are not opened | Nothing unusual |
+| Process inspection | **There is no listing of all processes.** `java.exe`/`javaw.exe` processes are picked **by name**, and only their command lines are read. Processes hosting an embedded JVM are found through the **services list** (read from the registry). Their DLL list is read only if the service's .exe sits in the same application folder as a Java runtime already found on disk, or is a Procrun/Tomcat wrapper. **Nothing under `%SystemRoot%` is ever opened**, so LSASS, system processes and security agents are never touched | Nothing unusual. *Versions before this change opened every process including LSASS, which raised an LSASS alert on a domain controller* |
+| Tier 0 servers (domain controllers, AD CS certificate authorities, AD FS, Entra/Azure AD Connect) | The collector checks the server's role and services first. On a Tier 0 server it **exits without scanning** and the server is reported as **Excluded**. Also list such servers in `ExcludeVMName` so nothing at all runs on them | One Run Command on that server (if it isn't in `ExcludeVMName`), lasting a few seconds |
+| Network paths from user-writable settings (`JAVA_HOME=\\server\share`) | **Only local drive paths are ever touched.** UNC and device paths are ignored, so SYSTEM never authenticates to another machine | Nothing |
+| Temp folder in `C:\Windows\Temp` (writable by users) | It is created fresh with SYSTEM + Administrators-only permissions. The script refuses to use it if it already exists or is a link. Cleanup deletes only this run's exact folder, never follows links, and never deletes recursively | File create/delete events |
+| Script tampering on your PC | The launcher shows the collector's SHA-256. Set `ExpectedCollectorSha256` in the launcher and the run **stops** if the script has changed | Nothing |
+| WDAC / AppLocker (Constrained Language Mode) | The collector detects it and stops cleanly with a clear message | Nothing |
+| CSV opened in Excel | Cells starting with `= + - @` are prefixed with `'`, which blocks formula injection | Nothing |
 | Recursive scan of every fixed drive and user profile | Read-only metadata (names and file version info). File contents are never opened, except Java's small `release` text file | Possibly a "file and directory discovery" signal in advanced hunting. Low severity |
 | Results gzip-compressed and base64-encoded in the output | Encode only. The script never decodes data and runs it (no `Invoke-Expression`, no downloads, no `Add-Type`) | Unlikely to alert. Mention it to the SOC so it isn't mistaken for data exfiltration |
 | Deleting its own temp file and script copies after the run | Deletes only files carrying the tool's marker, or its own temp folder. Logs are never touched | File deletion events. Covered by telling the SOC in advance |
-| Process command lines collected | Secret-looking values are masked (`password=*****`) | None |
+| Process command lines collected (Java processes only) | Secret-looking values are masked: `password=`, `token=`, `AccountKey=`, `SharedAccessKey=`, SAS `sig=`, `client_secret=`, `user:pass@` in URLs, JDBC `user/pass@`, `Bearer`/`Basic` tokens | None |
 | Unsigned scripts | Run Command runs them with its own execution policy | If **WDAC or AppLocker** is enforced, PowerShell drops to Constrained Language Mode and the collector **fails** (it uses .NET file APIs). Fix: sign the scripts with your organisation's code-signing certificate |
 
 **The report is internal-confidential.** It contains server names, user profile names (taken from paths) and masked command lines. Share it only with the people who need it.
@@ -183,6 +189,9 @@ Useful switches:
 | `-ResourceGroupName` | Limit the scan to specific resource groups |
 | `-EnvironmentLabel` | Fixed label for the Environment column, report title and folder name. The launchers set it to `DevApp` or `NonProd` |
 | `-EnvironmentTagName` | The tag used for the Environment column when no `-EnvironmentLabel` is given. Default: `Environment` |
+| `-ExcludeVMName` | VMs that are never touched, wildcards allowed. **Put your domain controllers and other Tier 0 servers here.** The launchers have it in `SETTINGS` |
+| `-ExpectedCollectorSha256` | The run stops unless `Get-JavaInventory.ps1` has exactly this hash. The launchers have it in `SETTINGS` |
+| `-IncludeTier0Servers` | **Not recommended.** Lets the collector scan domain controllers, CA, AD FS and Entra Connect servers |
 | `-ScanTimeoutMinutes` | Time limit for the disk scan. Default 45, hard maximum 80 (Run Command stops at 90 minutes) |
 | `-SkipJarScan` | Skip the JAR scan. It is a little faster but won't show software bundled with JARs |
 | `-KeepRunCommandExtension` | Don't remove the extension even if this run installed it |
@@ -197,7 +206,9 @@ Useful switches:
 | `JavaInventory_ServerStatus.csv` | One row per VM: Completed, Failed or Skipped, plus `TempFilesCleaned` and `ExtensionRemoved` |
 | `JavaInventory_State.json` | The pre-run state, used by `-CleanupOnly` |
 
-> **The inventory is complete only when Failed = 0 and Skipped = 0.** Stopped VMs are skipped because Run Command can't reach them, but they may still have Oracle Java on disk. Start them and scan again.
+> **The inventory is complete only when Failed = 0 and Skipped = 0.** Excluded servers (Tier 0, or excluded by name) are left out on purpose and listed in the report.
+>
+> **The `-ListOnly` dry run prints a warning for VM names that look like Tier 0 servers** (`dc`, `adfs`, `ca`, `aadc` ...). Check those, and add them to `ExcludeVMName` before the real run. Stopped VMs are skipped because Run Command can't reach them, but they may still have Oracle Java on disk. Start them and scan again.
 
 ## 7. Cross-check, if you have Defender for Servers or Defender for Endpoint
 
