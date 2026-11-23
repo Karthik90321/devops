@@ -35,6 +35,18 @@ The scan works through **Azure Run Command**, so you don't need WinRM, RDP or op
 
 **Bundled runtimes:** a Java runtime counts as **Bundled** when it isn't in a standard vendor folder and isn't registered as a standalone install. The owning application comes from the Add/Remove Programs install location, falling back to the application folder.
 
+**Per-user developer tools:** the scan covers every user profile under `C:\Users`, including users who aren't logged in and hidden dot-folders. Runtimes that IDEs bundle or download are named after their tool. Examples:
+- VS Code or Cursor extensions, e.g. SonarLint or Red Hat Java under `.vscode\extensions\...`
+- JDKs downloaded by IntelliJ (`.jdks`) or Gradle (`.gradle\jdks`)
+- JetBrains Toolbox IDEs
+- Eclipse plugins (`.p2`)
+- SDKMAN
+- the Maven repository (`.m2`)
+
+Each user's copy is reported separately.
+
+**Not detected:** Java runtimes still packed inside archives (`.zip`, `.tar`, `.tar.gz`, `.msi`, `.war`/`.ear` files) that have never been extracted. Only extracted folders are visible. A JDK installer or zip sitting in a Downloads folder isn't reported, and under Oracle's terms it usually doesn't count as a deployment either. Delete such files if they are Oracle.
+
 ## 2. Oracle licence risk rules (triage only, not legal advice)
 
 | Oracle version | Rating | Why |

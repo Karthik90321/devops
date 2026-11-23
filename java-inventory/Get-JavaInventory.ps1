@@ -299,7 +299,12 @@ function Get-AppRoot {
     $s1 = $seg[1].ToLowerInvariant()
     $n = 2
     if ($s1 -in @('program files', 'program files (x86)', 'programdata')) { $n = 3 }
-    elseif ($s1 -eq 'users') { if ($seg.Count -gt 3 -and $seg[3] -ieq 'appdata') { $n = 6 } else { $n = 4 } }
+    elseif ($s1 -eq 'users') {
+        if ($seg.Count -gt 3 -and $seg[3] -ieq 'appdata') { $n = 6 }
+        elseif ($seg.Count -gt 4 -and $seg[3] -match '^\.(vscode|vscode-server|vscode-insiders|cursor)$' -and $seg[4] -ieq 'extensions') { $n = 6 }   # one group per IDE extension
+        elseif ($seg.Count -gt 3 -and $seg[3].StartsWith('.')) { $n = 5 }                                                                     # .jdks\<jdk>, .m2\repository, .gradle\caches ...
+        else { $n = 4 }
+    }
     elseif ($s1 -in @('apps', 'app', 'applications', 'software', 'tools', 'opt', 'srv', 'data', 'install', 'installs')) { $n = 3 }
     $n = [math]::Min($n, $seg.Count)
     return ($seg[0..($n - 1)] -join '\')
@@ -307,6 +312,24 @@ function Get-AppRoot {
 
 function Get-OwningApplication {
     param([string]$Path)
+    # Per-user developer tools that bundle or download their own Java (not in Add/Remove Programs)
+    $userTools = @(
+        @{ Rx = '(?i)\\Users\\([^\\]+)\\\.vscode(?:-server|-insiders)?\\extensions\\([^\\]+)'; Fmt = 'VS Code extension {1} (user {0})' },
+        @{ Rx = '(?i)\\Users\\([^\\]+)\\\.cursor\\extensions\\([^\\]+)';                      Fmt = 'Cursor extension {1} (user {0})' },
+        @{ Rx = '(?i)\\Users\\([^\\]+)\\\.jdks\\([^\\]+)';                                     Fmt = 'JDK downloaded by IntelliJ/JetBrains IDE: {1} (user {0})' },
+        @{ Rx = '(?i)\\Users\\([^\\]+)\\AppData\\Local\\JetBrains\\Toolbox\\apps\\([^\\]+)';  Fmt = 'JetBrains IDE {1} (Toolbox, user {0})' },
+        @{ Rx = '(?i)\\Users\\([^\\]+)\\\.p2\\pool\\plugins\\([^\\]+)';                        Fmt = 'Eclipse IDE plugin {1} (user {0})' },
+        @{ Rx = '(?i)\\Users\\([^\\]+)\\\.gradle\\jdks\\([^\\]+)';                             Fmt = 'JDK downloaded by Gradle: {1} (user {0})' },
+        @{ Rx = '(?i)\\Users\\([^\\]+)\\\.m2\\';                                               Fmt = 'Maven local repository (user {0})' },
+        @{ Rx = '(?i)\\Users\\([^\\]+)\\\.sdkman\\candidates\\java\\([^\\]+)';                 Fmt = 'SDKMAN Java {1} (user {0})' }
+    )
+    foreach ($ut in $userTools) {
+        $m = [regex]::Match($Path, $ut.Rx)
+        if ($m.Success) {
+            $g2 = if ($m.Groups.Count -gt 2) { $m.Groups[2].Value } else { '' }
+            return @{ Name = ($ut.Fmt -f $m.Groups[1].Value, $g2); Publisher = '' }
+        }
+    }
     $pl = $Path.ToLowerInvariant()
     foreach ($o in $ownerTable) {
         $ol = $o.InstallLocation.ToLowerInvariant()
