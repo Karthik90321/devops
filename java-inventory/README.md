@@ -208,7 +208,7 @@ Useful switches:
 
 > **The inventory is complete only when Failed = 0 and Skipped = 0.** Excluded servers (Tier 0, or excluded by name) are left out on purpose and listed in the report.
 >
-> **The `-ListOnly` dry run prints a warning for VM names that look like Tier 0 servers** (`dc`, `adfs`, `ca`, `aadc` ...). Check those, and add them to `ExcludeVMName` before the real run. Stopped VMs are skipped because Run Command can't reach them, but they may still have Oracle Java on disk. Start them and scan again.
+> **The `-ListOnly` dry run prints a warning for VM names that look like Tier 0 servers** (`dc`, `adfs`, `ca`, `aadc` ...). Check those, and add them to `ExcludeVMName` before the real run. Stopped VMs are skipped because Run Command can't reach them. **The tool never starts, stops or changes any VM.** A stopped VM may still have Oracle Java on disk, so list stopped VMs in the audit as "not scanned (deallocated)". Scan them later only if their owners start them for their own reasons.
 
 ## 7. Cross-check, if you have Defender for Servers or Defender for Endpoint
 

@@ -161,7 +161,7 @@ if ($CleanupOnly) {
                 if ($ex) { $st.Status = 'Excluded'; $st.Detail = 'Excluded by ExcludeVMName - nothing was run on this VM'; continue }
             }
             if ($st.OsType -ne 'Windows') { $st.Status = 'Skipped'; $st.Detail = 'Not a Windows VM'; continue }
-            if ($st.PowerState -notmatch 'running') { $st.Status = 'Skipped'; $st.Detail = "VM not running ($($st.PowerState)) - start it or scan later"; continue }
+            if ($st.PowerState -notmatch 'running') { $st.Status = 'Skipped'; $st.Detail = "VM not running ($($st.PowerState)) - not scanned; the VM was left as it is (never started by this tool)"; continue }
             $targets.Add([pscustomobject]@{ Key = $key; Subscription = $sub; ResourceGroup = $vm.ResourceGroupName; Name = $vm.Name
                 Environment = $envName; ExtensionPreExisting = $false; Context = $ctx })
         }
