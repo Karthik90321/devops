@@ -54,6 +54,7 @@ param(
     [string[]]$ExcludeVMName,                  # wildcards allowed - never touched (e.g. domain controllers)
     [string]$ExpectedCollectorSha256,          # if set, the run stops unless Get-JavaInventory.ps1 has exactly this hash
     [switch]$IncludeTier0Servers,              # NOT recommended: lets the collector scan DCs / CA / AD FS / Entra Connect
+    [switch]$ShareKeepUserNames,               # keep user profile names in the Share package (default: replaced with <user>)
     [string]$EnvironmentTagName = 'Environment',
     [ValidatePattern('^[A-Za-z0-9_-]*$')][string]$EnvironmentLabel,   # e.g. DevApp / NonProd - overrides the tag for the Environment column, report title and folder name
     [ValidateRange(1, 50)][int]$ThrottleLimit = 10,
@@ -447,7 +448,7 @@ function New-Table { param($Rows, [string[]]$Columns, [string]$Empty = 'None fou
         foreach ($c in $Columns) {
             $v = [string]$r.$c
             $cls = ''
-            if ($c -eq 'OracleLicenseRisk' -or $c -eq 'Status') { $cls = " class='b-" + ($v -replace '[^A-Za-z]', '') + "'" }
+            if ($c -eq 'OracleLicenseRisk' -or $c -eq 'Status' -or $c -eq 'Coverage') { $cls = " class='b-" + (($v -split ' ')[0] -replace '[^A-Za-z]', '') + "'" }
             [void]$sb.Append("<td$cls>$(E $v)</td>")
         }
         [void]$sb.Append('</tr>')
@@ -456,43 +457,62 @@ function New-Table { param($Rows, [string[]]$Columns, [string]$Empty = 'None fou
     return $sb.ToString()
 }
 
-$installs   = @($sorted | Where-Object FindingType -eq 'Installation')
-$oracleInst = @($installs | Where-Object IsOracle -eq 'True')
-$highRisk   = @($oracle | Where-Object OracleLicenseRisk -eq 'High')
-$bundled    = @($installs | Where-Object Bundled -eq 'True')
-$jarBundles = @($sorted | Where-Object FindingType -eq 'JarBundle')
-$scanned    = @($statusRows | Where-Object { $_.Status -like 'Completed*' })
-$failed     = @($statusRows | Where-Object Status -eq 'Failed')
-$skipped    = @($statusRows | Where-Object Status -eq 'Skipped')
-$excluded   = @($statusRows | Where-Object Status -eq 'Excluded')
-$withJava   = @($installs | Select-Object -ExpandProperty VMName -Unique)
-
-$byVendor = @($installs | Group-Object Vendor, MajorVersion | Sort-Object Count -Descending | ForEach-Object {
-    [pscustomobject]@{ Vendor = $_.Group[0].Vendor; Major = $_.Group[0].MajorVersion; Installations = $_.Count
-        Servers = (@($_.Group | Select-Object -ExpandProperty VMName -Unique) -join ', ') } })
-
-$perServer = @($statusRows | ForEach-Object {
-    $n = $_.VMName
-    $mine = @($sorted | Where-Object VMName -eq $n)
-    [pscustomobject]@{ Environment = $_.Environment; VMName = $n; Status = $_.Status
-        Installations = @($mine | Where-Object FindingType -eq 'Installation').Count
-        Oracle = @($mine | Where-Object { $_.FindingType -eq 'Installation' -and $_.IsOracle -eq 'True' }).Count
-        HighRisk = @($mine | Where-Object OracleLicenseRisk -eq 'High').Count
-        Bundled = @($mine | Where-Object { $_.FindingType -eq 'Installation' -and $_.Bundled -eq 'True' }).Count
-        JarBundles = @($mine | Where-Object FindingType -eq 'JarBundle').Count
-        TempFilesCleaned = $_.TempFilesCleaned; ExtensionRemoved = $_.ExtensionRemoved } })
-
-$riskOrder = @{ 'High' = 0; 'Review' = 1; 'Low' = 2; 'None' = 3 }
-$oracleSorted = @($oracle | Sort-Object { $riskOrder[[string]$_.OracleLicenseRisk] }, Environment, VMName)
 $scopeText = "Subscriptions: $((@($contexts.Values | ForEach-Object { $_.Subscription.Name }) -join ', '))"
 if ($ResourceGroupName) { $scopeText += " | Resource groups: $($ResourceGroupName -join ', ')" }
 if ($TagName) { $scopeText += " | Tag: $TagName = $(if ($TagValue) { $TagValue -join ', ' } else { '(any)' })" }
 if ($VMName) { $scopeText += " | VM filter: $($VMName -join ', ')" }
-
 $reportTitle = 'Java Inventory Summary'
 if ($EnvironmentLabel) { $reportTitle += ' - ' + $EnvironmentLabel }
-$card = { param($label, $value, $cls) "<div class='card $cls'><div class='v'>$(E $value)</div><div class='l'>$(E $label)</div></div>" }
-$html = @"
+$riskOrder = @{ 'High' = 0; 'Review' = 1; 'Low' = 2; 'None' = 3 }
+
+function Write-HtmlReport {
+    param($Findings, $StatusRows, $CoverageRows, [string]$Path, [bool]$ShareMode)
+    $sorted     = @($Findings)
+    $statusRows = @($StatusRows)
+    $installs   = @($sorted | Where-Object FindingType -eq 'Installation')
+    $oracle     = @($sorted | Where-Object { $_.IsOracle -eq 'True' -or ($_.OracleLicenseRisk -and $_.OracleLicenseRisk -ne 'None') })
+    $oracleInst = @($installs | Where-Object IsOracle -eq 'True')
+    $highRisk   = @($oracle | Where-Object OracleLicenseRisk -eq 'High')
+    $bundled    = @($installs | Where-Object Bundled -eq 'True')
+    $jarBundles = @($sorted | Where-Object FindingType -eq 'JarBundle')
+    $scanned    = @($statusRows | Where-Object { $_.Status -like 'Completed*' })
+    $failed     = @($statusRows | Where-Object Status -eq 'Failed')
+    $skipped    = @($statusRows | Where-Object Status -eq 'Skipped')
+    $excluded   = @($statusRows | Where-Object Status -eq 'Excluded')
+    $withJava   = @($installs | Select-Object -ExpandProperty VMName -Unique)
+    $byVendor = @($installs | Group-Object Vendor, MajorVersion | Sort-Object Count -Descending | ForEach-Object {
+        [pscustomobject]@{ Vendor = $_.Group[0].Vendor; Major = $_.Group[0].MajorVersion; Installations = $_.Count
+            Servers = (@($_.Group | Select-Object -ExpandProperty VMName -Unique) -join ', ') } })
+    $oracleSorted = @($oracle | Sort-Object { $riskOrder[[string]$_.OracleLicenseRisk] }, Environment, VMName)
+
+    if ($ShareMode) {
+        $headerExtra  = ''
+        $jarDetailCol = 'JarDetails'
+        $sourceCol    = 'Evidence'
+        $otherCols    = @('Environment','VMName','FindingType','Vendor','Version','OwningApplication','Path','Evidence')
+        $serverSection = "<h2>Server coverage</h2>`n" + (New-Table $CoverageRows @('Environment','VMName','Coverage','JavaInstallations','OracleInstallations','OracleHighRisk'))
+    } else {
+        $headerExtra  = ' | Run ID ' + (E $RunId) + '<br>' + (E $scopeText) + '<br><b>INTERNAL copy - contains operational detail. Share the files in the Share folder instead.</b>'
+        $jarDetailCol = 'Details'
+        $sourceCol    = 'Source'
+        $otherCols    = @('Environment','VMName','FindingType','Vendor','Version','OwningApplication','Path','Details')
+        $perServer = @($statusRows | ForEach-Object {
+            $n = $_.VMName
+            $mine = @($sorted | Where-Object VMName -eq $n)
+            [pscustomobject]@{ Environment = $_.Environment; VMName = $n; Status = $_.Status
+                Installations = @($mine | Where-Object FindingType -eq 'Installation').Count
+                Oracle = @($mine | Where-Object { $_.FindingType -eq 'Installation' -and $_.IsOracle -eq 'True' }).Count
+                HighRisk = @($mine | Where-Object OracleLicenseRisk -eq 'High').Count
+                Bundled = @($mine | Where-Object { $_.FindingType -eq 'Installation' -and $_.Bundled -eq 'True' }).Count
+                JarBundles = @($mine | Where-Object FindingType -eq 'JarBundle').Count
+                TempFilesCleaned = $_.TempFilesCleaned; ExtensionRemoved = $_.ExtensionRemoved } })
+        $serverSection = "<h2>Per-server status and cleanup</h2>`n" +
+            (New-Table $perServer @('Environment','VMName','Status','Installations','Oracle','HighRisk','Bundled','JarBundles','TempFilesCleaned','ExtensionRemoved')) +
+            "`n<h2>Failed / skipped / excluded servers</h2>`n" +
+            (New-Table @($statusRows | Where-Object { $_.Status -in 'Failed','Skipped','Excluded' }) @('Environment','VMName','ResourceGroup','Status','Detail') 'None - every server in scope was scanned')
+    }
+    $card = { param($label, $value, $cls) "<div class='card $cls'><div class='v'>$(E $value)</div><div class='l'>$(E $label)</div></div>" }
+    $html = @"
 <!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>$(E $reportTitle)</title>
 <style>
@@ -512,7 +532,7 @@ th{position:sticky;top:0;background:var(--card);font-weight:600} td{word-break:b
 .note{background:var(--card);border-left:4px solid var(--rv);padding:10px 12px;border-radius:4px;margin-top:16px}
 </style></head><body><main>
 <h1>$(E $reportTitle)</h1>
-<div class="muted">Generated $(E (Get-Date -Format 'yyyy-MM-dd HH:mm')) | Run ID $(E $RunId)<br>$(E $scopeText)</div>
+<div class="muted">Generated $(E (Get-Date -Format 'yyyy-MM-dd HH:mm'))$headerExtra</div>
 <div class="cards">
 $(& $card 'VMs in scope' $statusRows.Count '')
 $(& $card 'Scanned' $scanned.Count '')
@@ -541,26 +561,85 @@ $(New-Table $byVendor @('Vendor','Major','Installations','Servers'))
 $(New-Table $bundled @('Environment','VMName','OwningApplication','Vendor','Version','JavaType','Path','OracleLicenseRisk'))
 
 <h2>Software bundled with JAR files</h2>
-$(New-Table $jarBundles @('Environment','VMName','Path','OwningApplication','Details'))
+$(New-Table $jarBundles @('Environment','VMName','Path','OwningApplication',$jarDetailCol))
 
 <h2>All Java installations</h2>
-$(New-Table $installs @('Environment','VMName','Vendor','Version','JavaType','Bundled','OwningApplication','Path','OracleLicenseRisk','Source'))
+$(New-Table $installs @('Environment','VMName','Vendor','Version','JavaType','Bundled','OwningApplication','Path','OracleLicenseRisk',$sourceCol))
 
 <h2>Other traces (Add/Remove Programs, launcher stubs, orphan registry keys, env vars, processes, services)</h2>
-$(New-Table @($sorted | Where-Object { $_.FindingType -in 'InstalledProgram','LauncherOrStub','RegistryTrace','EnvironmentVariable','RunningProcess','Service' }) @('Environment','VMName','FindingType','Vendor','Version','OwningApplication','Path','Details'))
+$(New-Table @($sorted | Where-Object { $_.FindingType -in 'InstalledProgram','LauncherOrStub','RegistryTrace','EnvironmentVariable','RunningProcess','Service' }) $otherCols)
 
-<h2>Per-server status and cleanup</h2>
-$(New-Table $perServer @('Environment','VMName','Status','Installations','Oracle','HighRisk','Bundled','JarBundles','TempFilesCleaned','ExtensionRemoved'))
-
-<h2>Failed / skipped / excluded servers</h2>
-$(New-Table @($statusRows | Where-Object { $_.Status -in 'Failed','Skipped','Excluded' }) @('Environment','VMName','ResourceGroup','Status','Detail') 'None - every server in scope was scanned')
+$serverSection
 </main></body></html>
 "@
-$htmlPath = Join-Path $OutputFolder 'JavaInventory_Summary.html'
-Set-Content -LiteralPath $htmlPath -Value $html -Encoding UTF8
+    Set-Content -LiteralPath $Path -Value $html -Encoding UTF8
+}
 
-Write-Log ("Done. Scanned {0}, failed {1}, skipped {2}. Java installations: {3} (Oracle: {4}, HIGH risk rows: {5})" -f `
-    $scanned.Count, $failed.Count, $skipped.Count, $installs.Count, $oracleInst.Count, $highRisk.Count) 'OK'
+# ---- INTERNAL report (for you: full detail incl. cleanup / technical status) ----
+Write-HtmlReport -Findings $sorted -StatusRows $statusRows -CoverageRows @() -Path (Join-Path $OutputFolder 'JavaInventory_Summary.html') -ShareMode $false
+
+# ---- SHARE package (Java-related information only) ----
+#   - only Java findings (no ScanInfo rows, no technical/operational details, no Run ID, no subscription/resource group names)
+#   - no process IDs, command lines, registry hives, user SIDs, file metadata, cleanup or extension status
+#   - service rows show only the service executable path (no arguments)
+#   - user profile names in paths are replaced with <user> unless -ShareKeepUserNames is used
+#   - a coverage list (scanned / not scanned) so "no Java found" is not confused with "not checked"
+$shareDir = Join-Path $OutputFolder 'Share'
+$null = New-Item -ItemType Directory -Path $shareDir -Force
+$sharePrefix = 'JavaInventory_'
+if ($EnvironmentLabel) { $sharePrefix += $EnvironmentLabel + '_' }
+function Hide-UserName { param([string]$Text)
+    if ($ShareKeepUserNames -or -not $Text) { return $Text }
+    $t = [regex]::Replace($Text, '(?i)(\\Users\\)[^\\]+', '$1<user>')
+    $t = [regex]::Replace($t, '(?i)\(user [^)]*\)', '(user <user>)')
+    return $t
+}
+$shareTypes = 'Installation', 'LauncherOrStub', 'InstalledProgram', 'RegistryTrace', 'EnvironmentVariable', 'JarBundle', 'RunningProcess', 'Service'
+$shareFindings = @($sorted | Where-Object { $shareTypes -contains $_.FindingType } | ForEach-Object {
+    $p = [string]$_.Path
+    if ($_.FindingType -eq 'Service') {
+        if ($p -match '^\s*"([^"]+)"') { $p = $matches[1] } elseif ($p -match '^\s*(\S+?\.exe)') { $p = $matches[1] }
+    }
+    $jd = if ($_.FindingType -eq 'JarBundle') { [string]$_.Details } else { '' }
+    [pscustomobject][ordered]@{
+        Environment = $_.Environment; VMName = $_.VMName; FindingType = $_.FindingType; Vendor = $_.Vendor
+        Version = $_.Version; MajorVersion = $_.MajorVersion; UpdateVersion = $_.UpdateVersion; JavaType = $_.JavaType
+        Bundled = $_.Bundled; OwningApplication = (Hide-UserName ([string]$_.OwningApplication)); Path = (Hide-UserName $p)
+        IsOracle = $_.IsOracle; OracleLicenseRisk = $_.OracleLicenseRisk; LicenseNote = $_.LicenseNote
+        Evidence = $_.Source; JarDetails = (Hide-UserName $jd)
+    }
+})
+$shareOracle = @($shareFindings | Where-Object { $_.IsOracle -eq 'True' -or ($_.OracleLicenseRisk -and $_.OracleLicenseRisk -ne 'None') } |
+                 Sort-Object { $riskOrder[[string]$_.OracleLicenseRisk] }, Environment, VMName)
+$coverage = @($statusRows | ForEach-Object {
+    $n = $_.VMName
+    $cov = switch -Wildcard ($_.Status) {
+        'Completed (partial*' { 'Scanned (partial - time limit reached)' }
+        'Completed*'          { 'Scanned' }
+        'Excluded'            { 'Not scanned - excluded by design (Tier 0 / excluded server)' }
+        'Failed'              { 'Not scanned - technical failure' }
+        'Skipped'             { if ($_.OsType -ne 'Windows') { 'Not scanned - not a Windows server' } else { 'Not scanned - VM not running' } }
+        default               { 'Not scanned' }
+    }
+    $mine = @($shareFindings | Where-Object { $_.VMName -eq $n -and $_.FindingType -eq 'Installation' })
+    [pscustomobject][ordered]@{
+        Environment = $_.Environment; VMName = $n; Coverage = $cov
+        JavaInstallations = $mine.Count
+        OracleInstallations = @($mine | Where-Object IsOracle -eq 'True').Count
+        OracleHighRisk = @($shareFindings | Where-Object { $_.VMName -eq $n -and $_.OracleLicenseRisk -eq 'High' }).Count
+    }
+})
+$shareFindings | ConvertTo-SafeCsvRow | Export-Csv (Join-Path $shareDir ($sharePrefix + 'Java_Findings.csv')) -NoTypeInformation -Encoding UTF8
+$shareOracle   | ConvertTo-SafeCsvRow | Export-Csv (Join-Path $shareDir ($sharePrefix + 'Oracle.csv')) -NoTypeInformation -Encoding UTF8
+$coverage      | ConvertTo-SafeCsvRow | Export-Csv (Join-Path $shareDir ($sharePrefix + 'Coverage.csv')) -NoTypeInformation -Encoding UTF8
+Write-HtmlReport -Findings $shareFindings -StatusRows $statusRows -CoverageRows $coverage -Path (Join-Path $shareDir ($sharePrefix + 'Summary.html')) -ShareMode $true
+Write-Log "Share package (Java information only): $shareDir" 'OK'
+
+$sumInstalls = @($sorted | Where-Object FindingType -eq 'Installation')
+Write-Log ("Done. Scanned {0}, failed {1}, skipped {2}, excluded {3}. Java installations: {4} (Oracle: {5}, HIGH risk rows: {6})" -f `
+    @($statusRows | Where-Object { $_.Status -like 'Completed*' }).Count, @($statusRows | Where-Object Status -eq 'Failed').Count,
+    @($statusRows | Where-Object Status -eq 'Skipped').Count, @($statusRows | Where-Object Status -eq 'Excluded').Count,
+    $sumInstalls.Count, @($sumInstalls | Where-Object IsOracle -eq 'True').Count, @($sorted | Where-Object OracleLicenseRisk -eq 'High').Count) 'OK'
 $notClean = @($statusRows | Where-Object { $_.TempFilesCleaned -like 'FAILED*' -or $_.ExtensionRemoved -like 'FAILED*' })
 if ($notClean.Count) { Write-Log ("Cleanup incomplete on {0} VM(s): {1}. Re-run with -CleanupOnly -StateFile '{2}'" -f $notClean.Count, ($notClean.VMName -join ', '), (Join-Path $OutputFolder 'JavaInventory_State.json')) 'WARN' }
 Write-Log "Reports: $OutputFolder"

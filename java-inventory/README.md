@@ -196,15 +196,35 @@ Useful switches:
 | `-SkipJarScan` | Skip the JAR scan. It is a little faster but won't show software bundled with JARs |
 | `-KeepRunCommandExtension` | Don't remove the extension even if this run installed it |
 
-## 6. Output (in `.\JavaInventory_<timestamp>\`)
+## 6. Output (in `.\JavaInventory_<DevApp|NonProd>_<timestamp>\`)
+
+### `Share\`: the files you send to the onshore team (Java information only)
+
+| File | Content |
+|---|---|
+| `JavaInventory_<Env>_Summary.html` | Summary cards, Oracle findings (High first), vendor/version pivot, bundled runtimes, JAR bundles, all installations, other Java traces, and **server coverage** |
+| `JavaInventory_<Env>_Java_Findings.csv` | One row per Java finding. Columns: Environment, VMName, FindingType, Vendor, Version, MajorVersion, UpdateVersion, JavaType, Bundled, OwningApplication, Path, IsOracle, OracleLicenseRisk, LicenseNote, Evidence, JarDetails |
+| `JavaInventory_<Env>_Oracle.csv` | Oracle-related rows only, High first |
+| `JavaInventory_<Env>_Coverage.csv` | One row per VM: **Scanned** / **Not scanned** (with a plain reason) and Java/Oracle counts. Without it, "no Java found" and "not checked" would look the same |
+
+**Left out of the Share package:**
+- the scan technical row (OS, folder counts, time taken)
+- Run ID, subscription and resource group names
+- process IDs and **command lines**
+- registry hive paths, user SIDs, file metadata
+- service arguments (only the service's .exe path is kept)
+- cleanup and extension status
+- **user profile names**: `C:\Users\john.doe\...` becomes `C:\Users\<user>\...`. Use `-ShareKeepUserNames` with the engine if the onshore team needs to know whose copy it is
+
+### Main folder: INTERNAL, for you only, do not share
 
 | File | For |
 |---|---|
-| `JavaInventory_Summary.html` | Management and licensing summary: counts, Oracle findings (High first), vendor/version pivot, bundled software, JAR bundles, per-server cleanup status, failed and skipped servers |
-| `JavaInventory_Findings.csv` | Every finding, one row each. Columns: Environment, VMName, FindingType, Vendor, Version, MajorVersion, UpdateVersion, JavaType, Bundled, OwningApplication, Path, IsOracle, OracleLicenseRisk, LicenseNote, Source, Details, ResourceGroup, Subscription, ScanTime |
-| `JavaInventory_Oracle.csv` | Oracle-related rows only, ready to hand to the licensing team |
-| `JavaInventory_ServerStatus.csv` | One row per VM: Completed, Failed or Skipped, plus `TempFilesCleaned` and `ExtensionRemoved` |
-| `JavaInventory_State.json` | The pre-run state, used by `-CleanupOnly` |
+| `JavaInventory_Summary.html` | Full internal summary, including per-server technical status and cleanup results |
+| `JavaInventory_Findings.csv` | Every finding with all technical detail (Details, ScanInfo rows, Subscription, ResourceGroup) |
+| `JavaInventory_Oracle.csv` | Oracle rows with full detail |
+| `JavaInventory_ServerStatus.csv` | One row per VM: technical status, `TempFilesCleaned`, `ExtensionRemoved`. **This is your proof that the cleanup worked** |
+| `JavaInventory_State.json` | The pre-run state, needed for `-CleanupOnly` |
 
 > **The inventory is complete only when Failed = 0 and Skipped = 0.** Excluded servers (Tier 0, or excluded by name) are left out on purpose and listed in the report.
 >
