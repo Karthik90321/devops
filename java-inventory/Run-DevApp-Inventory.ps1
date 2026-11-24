@@ -26,8 +26,10 @@ $Settings = @{
     EnvironmentLabel   = 'DevApp'
     SubscriptionId     = @('<FILL-ME: DevApp subscription ID (GUID)>')   # add more IDs if DevApp spans several subscriptions
     ResourceGroupName  = @()          # optional: e.g. @('rg-devapp-app', 'rg-devapp-web'); empty = all resource groups
-    ExcludeVMName      = @()          # VMs never touched, wildcards allowed, e.g. @('devdc01', '*-dc*', '*adfs*')
-                                      # PUT YOUR DOMAIN CONTROLLERS / CA / AD FS / ENTRA CONNECT SERVERS HERE
+    IncludeTier0Servers = $false      # $true = ALSO SCAN domain controllers / CA / AD FS / Entra Connect servers.
+                                      # Set to $true ONLY after the SOC and the AD owner approved DC scanning for the
+                                      # announced window. With $false the collector refuses those servers.
+    ExcludeVMName      = @()          # VMs never touched at all, wildcards allowed, e.g. @('devdc01', '*adfs*')
     ExpectedCollectorSha256 = ''      # paste the SHA-256 of the APPROVED Get-JavaInventory.ps1 (the hash in your SOC mail);
                                       # the run then stops if the script was changed. Get it with:
                                       #   (Get-FileHash .\Get-JavaInventory.ps1 -Algorithm SHA256).Hash
@@ -42,6 +44,7 @@ if (-not $Settings.ResourceGroupName.Count) { $Settings.Remove('ResourceGroupNam
 if (-not $Settings.VMName.Count)            { $Settings.Remove('VMName') }
 if (-not $Settings.ExcludeVMName.Count)     { $Settings.Remove('ExcludeVMName') }
 if (-not $Settings.ExpectedCollectorSha256) { $Settings.Remove('ExpectedCollectorSha256') }
+if (-not $Settings.IncludeTier0Servers)     { $Settings.Remove('IncludeTier0Servers') }
 if ($ListOnly)    { $Settings.ListOnly = $true }
 if ($Force)       { $Settings.Force = $true }
 if ($SkipJarScan) { $Settings.SkipJarScan = $true }

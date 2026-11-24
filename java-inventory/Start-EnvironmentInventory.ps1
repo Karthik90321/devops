@@ -23,6 +23,7 @@ param(
     [int]$ThrottleLimit = 10,
     [int]$ScanTimeoutMinutes = 45,
     [switch]$SkipJarScan,
+    [switch]$IncludeTier0Servers,
     [switch]$ListOnly,
     [switch]$Force,
     [switch]$CleanupOnly,
@@ -67,6 +68,12 @@ foreach ($si in $subInfo) { Write-Host ("  Subscription : {0}  ({1})  state: {2}
 if ($ResourceGroupName) { Write-Host ("  Resource groups : {0}" -f ($ResourceGroupName -join ', ')) } else { Write-Host '  Resource groups : ALL in the subscription(s)' }
 if ($VMName) { Write-Host ("  VM filter    : {0}" -f ($VMName -join ', ')) } else { Write-Host '  VM filter    : ALL running Windows VMs' }
 if ($ExcludeVMName) { Write-Host ("  Excluded VMs : {0}" -f ($ExcludeVMName -join ', ')) } else { Write-Host '  Excluded VMs : none by name (Tier 0 servers are still refused by the collector itself)' }
+if ($IncludeTier0Servers) {
+    Write-Host '  Tier 0       : DOMAIN CONTROLLERS / CA / AD FS / ENTRA CONNECT WILL BE SCANNED' -ForegroundColor Red
+    Write-Host '                 Make sure the SOC and the AD owner approved this, and announced the window.' -ForegroundColor Red
+} else {
+    Write-Host '  Tier 0       : not scanned (collector refuses DC / CA / AD FS / Entra Connect)'
+}
 Write-Host ("  Collector    : SHA-256 {0} {1}" -f $collectorHash, $(if ($ExpectedCollectorSha256) { '(matches approved hash)' } else { '(no approved hash set - see SETTINGS)' }))
 Write-Host ("  Signed in as : {0}" -f (Get-AzContext).Account.Id)
 Write-Host '=======================================================================' -ForegroundColor Cyan
@@ -76,7 +83,7 @@ if ($looksProd.Count) {
 }
 
 # 4. Confirmation (not needed for a dry run)
-if (-not $ListOnly -and (-not $Force -or $looksProd.Count)) {
+if (-not $ListOnly -and (-not $Force -or $looksProd.Count -or $IncludeTier0Servers)) {
     $answer = Read-Host "Type '$EnvironmentLabel' to start the scan (anything else cancels)"
     if ($answer -cne $EnvironmentLabel) { Write-Host 'Cancelled. Nothing was run.' -ForegroundColor Yellow; return }
 }
@@ -94,6 +101,7 @@ if ($VMName)            { $p.VMName = $VMName }
 if ($ExcludeVMName)     { $p.ExcludeVMName = $ExcludeVMName }
 if ($ExpectedCollectorSha256) { $p.ExpectedCollectorSha256 = $ExpectedCollectorSha256 }
 if ($SkipJarScan)       { $p.SkipJarScan = $true }
+if ($IncludeTier0Servers) { $p.IncludeTier0Servers = $true }
 if ($ListOnly)          { $p.ListOnly = $true }
 if ($CleanupOnly)       { $p.CleanupOnly = $true; $p.StateFile = $StateFile }
 if ($OutputFolder)      { $p.OutputFolder = $OutputFolder }

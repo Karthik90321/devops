@@ -88,7 +88,7 @@ These are audit records, and deleting them would be a security problem.
 |---|---|---|
 | Azure Run Command runs PowerShell as SYSTEM on many VMs | Required by the design. It is a documented Azure feature | Defender for Cloud / Defender for Servers can raise **Run Command usage** alerts. **Tell the SOC the run window in advance** |
 | Process inspection | **There is no listing of all processes.** `java.exe`/`javaw.exe` processes are picked **by name**, and only their command lines are read. Processes hosting an embedded JVM are found through the **services list** (read from the registry). Their DLL list is read only if the service's .exe sits in the same application folder as a Java runtime already found on disk, or is a Procrun/Tomcat wrapper. **Nothing under `%SystemRoot%` is ever opened**, so LSASS, system processes and security agents are never touched | Nothing unusual. *Versions before this change opened every process including LSASS, which raised an LSASS alert on a domain controller* |
-| Tier 0 servers (domain controllers, AD CS certificate authorities, AD FS, Entra/Azure AD Connect) | The collector checks the server's role and services first. On a Tier 0 server it **exits without scanning** and the server is reported as **Excluded**. Also list such servers in `ExcludeVMName` so nothing at all runs on them | One Run Command on that server (if it isn't in `ExcludeVMName`), lasting a few seconds |
+| Tier 0 servers (domain controllers, AD CS certificate authorities, AD FS, Entra/Azure AD Connect) | The collector checks the server's role and services first. **By default**, on a Tier 0 server it **exits without scanning** and the server is reported as **Excluded**. Set `IncludeTier0Servers = $true` in the launcher to scan them. The scan is the same read-only scan, and LSASS is still never touched. Only do this after the SOC and the AD owner have approved DC scanning | Default: one short Run Command. With `IncludeTier0Servers`: a full read-only scan on the DC, which is **visible to DC monitoring**, so announce it |
 | Network paths from user-writable settings (`JAVA_HOME=\\server\share`) | **Only local drive paths are ever touched.** UNC and device paths are ignored, so SYSTEM never authenticates to another machine | Nothing |
 | Temp folder in `C:\Windows\Temp` (writable by users) | It is created fresh with SYSTEM + Administrators-only permissions. The script refuses to use it if it already exists or is a link. Cleanup deletes only this run's exact folder, never follows links, and never deletes recursively | File create/delete events |
 | Script tampering on your PC | The launcher shows the collector's SHA-256. Set `ExpectedCollectorSha256` in the launcher and the run **stops** if the script has changed | Nothing |
@@ -189,9 +189,9 @@ Useful switches:
 | `-ResourceGroupName` | Limit the scan to specific resource groups |
 | `-EnvironmentLabel` | Fixed label for the Environment column, report title and folder name. The launchers set it to `DevApp` or `NonProd` |
 | `-EnvironmentTagName` | The tag used for the Environment column when no `-EnvironmentLabel` is given. Default: `Environment` |
-| `-ExcludeVMName` | VMs that are never touched, wildcards allowed. **Put your domain controllers and other Tier 0 servers here.** The launchers have it in `SETTINGS` |
+| `-ExcludeVMName` | VMs that are never touched, wildcards allowed. The launchers have it in `SETTINGS` |
 | `-ExpectedCollectorSha256` | The run stops unless `Get-JavaInventory.ps1` has exactly this hash. The launchers have it in `SETTINGS` |
-| `-IncludeTier0Servers` | **Not recommended.** Lets the collector scan domain controllers, CA, AD FS and Entra Connect servers |
+| `-IncludeTier0Servers` | Also scan domain controllers, CA, AD FS and Entra Connect servers. In the launchers this is the `IncludeTier0Servers = $true/$false` setting. When it is on, the launcher always asks for typed confirmation, even with `-Force` |
 | `-ScanTimeoutMinutes` | Time limit for the disk scan. Default 45, hard maximum 80 (Run Command stops at 90 minutes) |
 | `-SkipJarScan` | Skip the JAR scan. It is a little faster but won't show software bundled with JARs |
 | `-KeepRunCommandExtension` | Don't remove the extension even if this run installed it |
@@ -223,12 +223,12 @@ Useful switches:
 | `JavaInventory_Summary.html` | Full internal summary, including per-server technical status and cleanup results |
 | `JavaInventory_Findings.csv` | Every finding with all technical detail (Details, ScanInfo rows, Subscription, ResourceGroup) |
 | `JavaInventory_Oracle.csv` | Oracle rows with full detail |
-| `JavaInventory_ServerStatus.csv` | One row per VM: technical status, `TempFilesCleaned`, `ExtensionRemoved`. **This is your proof that the cleanup worked** |
+| `JavaInventory_ServerStatus.csv` | One row per VM with its technical status. Cleanup and extension removal still run but aren't reported in any file; a failure is shown on screen with a `-CleanupOnly` hint |
 | `JavaInventory_State.json` | The pre-run state, needed for `-CleanupOnly` |
 
 > **The inventory is complete only when Failed = 0 and Skipped = 0.** Excluded servers (Tier 0, or excluded by name) are left out on purpose and listed in the report.
 >
-> **The `-ListOnly` dry run prints a warning for VM names that look like Tier 0 servers** (`dc`, `adfs`, `ca`, `aadc` ...). Check those, and add them to `ExcludeVMName` before the real run. Stopped VMs are skipped because Run Command can't reach them. **The tool never starts, stops or changes any VM.** A stopped VM may still have Oracle Java on disk, so list stopped VMs in the audit as "not scanned (deallocated)". Scan them later only if their owners start them for their own reasons.
+> **The `-ListOnly` dry run prints a warning for VM names that look like Tier 0 servers** (`dc`, `adfs`, `ca`, `aadc` ...). Check those before the real run. With `IncludeTier0Servers = $false` they are refused by the collector. Add them to `ExcludeVMName` if nothing at all should run on them. Stopped VMs are skipped because Run Command can't reach them. **The tool never starts, stops or changes any VM.** A stopped VM may still have Oracle Java on disk, so list stopped VMs in the audit as "not scanned (deallocated)". Scan them later only if their owners start them for their own reasons.
 
 ## 7. Cross-check, if you have Defender for Servers or Defender for Endpoint
 

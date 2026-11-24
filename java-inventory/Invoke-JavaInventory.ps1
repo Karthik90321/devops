@@ -104,6 +104,7 @@ if (-not (Get-AzContext)) { throw 'Not signed in to Azure. Run Connect-AzAccount
 $null = New-Item -ItemType Directory -Path $OutputFolder -Force
 Write-Log "Output folder: $OutputFolder"
 Write-Log "Collector SHA-256: $CollectorHash"
+if ($IncludeTier0Servers) { Write-Log 'IncludeTier0Servers is ON: domain controllers / CA / AD FS / Entra Connect servers in scope WILL be scanned.' 'WARN' }
 
 # ------------------------------------------------------------------------------------------------
 # Discover target VMs (or load them from a state file)
@@ -154,7 +155,7 @@ if ($CleanupOnly) {
                 VMName = $vm.Name; ResourceGroup = $vm.ResourceGroupName; Subscription = $ctx.Subscription.Name; Environment = $envName
                 OsType = [string]$vm.StorageProfile.OsDisk.OsType; PowerState = [string]$vm.PowerState
                 Status = 'Pending'; Detail = ''; Chunks = 0; Findings = 0; ExtensionPreExisting = ''; TempFilesCleaned = ''; ExtensionRemoved = ''
-                Tier0Hint = $(if ($vm.Name -match $Tier0NameRx) { 'CHECK: name looks like a Tier 0 server (DC/CA/ADFS/Entra Connect) - add to ExcludeVMName' } else { '' })
+                Tier0Hint = $(if ($vm.Name -match $Tier0NameRx) { if ($IncludeTier0Servers) { 'Tier 0-looking name (DC/CA/ADFS/Entra Connect) - WILL BE SCANNED (IncludeTier0Servers is on)' } else { 'CHECK: name looks like a Tier 0 server (DC/CA/ADFS/Entra Connect) - the collector will refuse it; add to ExcludeVMName to avoid any Run Command' } } else { '' })
             }
             $status[$key] = $st
             if ($ExcludeVMName) {
@@ -423,7 +424,9 @@ function ConvertTo-SafeCsvRow { param([Parameter(ValueFromPipeline)]$Row, [strin
     }
 }
 $statusRows = @($status.Values | Sort-Object Environment, VMName)
-$statusRows | ConvertTo-SafeCsvRow | Export-Csv (Join-Path $OutputFolder 'JavaInventory_ServerStatus.csv') -NoTypeInformation -Encoding UTF8
+# Cleanup / extension details are not written to any report (not required); failures are still shown on screen.
+$statusRows | Select-Object * -ExcludeProperty TempFilesCleaned, ExtensionRemoved, ExtensionPreExisting | ConvertTo-SafeCsvRow |
+    Export-Csv (Join-Path $OutputFolder 'JavaInventory_ServerStatus.csv') -NoTypeInformation -Encoding UTF8
 if ($CleanupOnly) {
     $statusRows | Format-Table VMName, TempFilesCleaned, ExtensionRemoved -AutoSize
     Write-Log 'Cleanup-only run finished.' 'OK'
@@ -504,10 +507,9 @@ function Write-HtmlReport {
                 Oracle = @($mine | Where-Object { $_.FindingType -eq 'Installation' -and $_.IsOracle -eq 'True' }).Count
                 HighRisk = @($mine | Where-Object OracleLicenseRisk -eq 'High').Count
                 Bundled = @($mine | Where-Object { $_.FindingType -eq 'Installation' -and $_.Bundled -eq 'True' }).Count
-                JarBundles = @($mine | Where-Object FindingType -eq 'JarBundle').Count
-                TempFilesCleaned = $_.TempFilesCleaned; ExtensionRemoved = $_.ExtensionRemoved } })
-        $serverSection = "<h2>Per-server status and cleanup</h2>`n" +
-            (New-Table $perServer @('Environment','VMName','Status','Installations','Oracle','HighRisk','Bundled','JarBundles','TempFilesCleaned','ExtensionRemoved')) +
+                JarBundles = @($mine | Where-Object FindingType -eq 'JarBundle').Count } })
+        $serverSection = "<h2>Per-server status</h2>`n" +
+            (New-Table $perServer @('Environment','VMName','Status','Installations','Oracle','HighRisk','Bundled','JarBundles')) +
             "`n<h2>Failed / skipped / excluded servers</h2>`n" +
             (New-Table @($statusRows | Where-Object { $_.Status -in 'Failed','Skipped','Excluded' }) @('Environment','VMName','ResourceGroup','Status','Detail') 'None - every server in scope was scanned')
     }
